@@ -1,0 +1,14 @@
+fastapi
+uvicorn[standard]
+pydantic
+chromadb
+langchain
+langchain-classic
+langgraph
+langchain-community
+langchain-openai
+langchain-ollama
+python-dotenv
+httpx
+pymysql
+sqlalchemy
