@@ -1,10 +1,19 @@
 import type { ChatMessage } from '../types/chat'
+import { AssistantMessageContent } from './AssistantMessageContent'
 
 type Props = {
   messages: ChatMessage[]
+  orderConfirmChoice?: Record<string, 'confirm' | 'cancel'>
+  orderConfirmSubmitting?: { messageId: string; side: 'confirm' | 'cancel' } | null
+  onOrderConfirm?: (messageId: string, confirm: boolean) => void
 }
 
-export function MessageList({ messages }: Props) {
+export function MessageList({
+  messages,
+  orderConfirmChoice,
+  orderConfirmSubmitting,
+  onOrderConfirm,
+}: Props) {
   return (
     <div className="message-list" role="log" aria-live="polite" aria-relevant="additions">
       {messages.map((m) => (
@@ -13,10 +22,22 @@ export function MessageList({ messages }: Props) {
           className={`bubble bubble--${m.role}`}
           aria-label={m.role === 'user' ? '玩家' : '客服'}
         >
-          <div className="bubble-meta">
-            {m.role === 'user' ? '我' : '客服'}
+          <div className="bubble-meta">{m.role === 'user' ? '我' : '客服'}</div>
+          <div className={`bubble-content ${m.role === 'assistant' ? 'bubble-content--rich' : ''}`}>
+            {m.role === 'assistant' ? (
+              <AssistantMessageContent
+                content={m.content}
+                messageId={m.id}
+                confirmChoice={orderConfirmChoice?.[m.id]}
+                confirmSubmittingSide={
+                  orderConfirmSubmitting?.messageId === m.id ? orderConfirmSubmitting.side : undefined
+                }
+                onConfirmAction={onOrderConfirm}
+              />
+            ) : (
+              m.content
+            )}
           </div>
-          <div className="bubble-content">{m.content}</div>
           {m.role === 'assistant' && m.citations && m.citations.length > 0 ? (
             <div className="citations" aria-label="引用来源">
               <div className="citations-title">引用来源</div>

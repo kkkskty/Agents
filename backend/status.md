@@ -17,7 +17,7 @@
 
 ---
 
-## 2. route（路由状态）
+## 2. route（路由状态） 
 
 字段位置：
 - `runtime.route`（图中间态）
@@ -52,7 +52,6 @@
 - `safe_response`
 - `collecting_info`
 - `awaiting_pre_confirm`
-- `executed_waiting_click`
 - `closed`
 - `failed`
 
@@ -82,7 +81,7 @@
 
 ### 5.1 订单会话真源
 - `OrderContext` 由 `SessionStore` 独立持有，不再镜像到 `GraphState.session`。
-- 订单流程阶段使用 `OrderStatus`：`collecting_info` / `awaiting_pre_confirm` / `executed_waiting_click` / `closed` / `failed`。
+- 订单流程阶段使用 `OrderStatus`：`collecting_info` / `awaiting_pre_confirm` / `closed` / `failed`。
 
 ### 5.2 订单轨迹（trace）
 - `trace.order_trace.records: list[OrderTaskRecord]`
@@ -146,7 +145,7 @@ flowchart TD
 1. `error` / `safe_response`：展示失败与重试建议
 2. `clarify`：展示澄清引导
 3. `handoff`：展示人工处理中
-4. `collecting_info` / `awaiting_pre_confirm` / `executed_waiting_click`：展示订单流程 UI
+4. `collecting_info` / `awaiting_pre_confirm`：展示订单流程 UI
 5. `no_result`：展示无数据提示
 6. `ok` / `closed`：展示成功结果
 
@@ -157,3 +156,13 @@ flowchart TD
 - `session_meta` 节点已停用：不再走“会话回顾短路”，统一进入意图拆解。
 - `SessionMetaTask` 目前仅为兼容类型保留，路由器已将 `session_meta` 意图降级为 `unknown`。
 - 订单“先查询再下单”依赖 `proposed_order_items` 输出约定；若上游未产出，订单节点会显式报 `missing_dependency_items`。
+- 当存在活跃订单时，编排采用“严格订单主线”策略：
+  - `decompose` 阶段直接构建单一 `OrderTask`，不再插入其它子任务
+  - `dispatch` 阶段在活跃订单下统一路由 `order`
+  - 只有订单进入 `closed/failed` 后，才恢复常规意图拆解与多任务执行
+  - 当订单状态为 `collecting_info` 时，`collect_result` 会追加 `pending_actions[type=order_fill_fields]`：
+    - 携带 `operation`、`required_fields`（含中文 label）与 `prefill`
+    - 前端可据此弹出表单引导用户填写，而非依赖自由文本补字段
+  - 已提供结构化提交接口：`POST /api/v1/orders/fill-fields`
+    - 入参：`session_id`、`user_id`、`fields`
+    - 出参：`status/message/action_required/pending_actions/order_link`

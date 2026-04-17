@@ -14,6 +14,10 @@ FROM_TABLE_PATTERN = re.compile(
     r"\bfrom\s+(?:`([^`]+)`|([a-zA-Z_][a-zA-Z0-9_]*))(?=\s|$|;|\))",
     re.IGNORECASE,
 )
+JOIN_TABLE_PATTERN = re.compile(
+    r"\bjoin\s+(?:`([^`]+)`|([a-zA-Z_][a-zA-Z0-9_]*))(?=\s|$|;|\))",
+    re.IGNORECASE,
+)
 LIMIT_PATTERN = re.compile(r"\blimit\s+\d+\s*$", re.IGNORECASE)
 
 # WHERE 子句中出现的 user_id = 字面量须与当前会话用户一致（防模型代查他人）
@@ -29,6 +33,26 @@ def _extract_table_name(sql: str) -> str | None:
         return None
     name = (m.group(1) or m.group(2) or "").strip()
     return name.lower() if name else None
+
+
+def _extract_referenced_tables(sql: str) -> set[str]:
+    def _normalize_table_token(raw: str) -> str:
+        # 兼容 schema.table / `schema`.`table` / table 三种写法，只保留实际表名部分。
+        token = str(raw or "").strip().strip("`").lower()
+        if "." in token:
+            token = token.split(".")[-1].strip("`")
+        return token
+
+    tables: set[str] = set()
+    for m in FROM_TABLE_PATTERN.finditer(sql or ""):
+        name = _normalize_table_token(m.group(1) or m.group(2) or "")
+        if name:
+            tables.add(name)
+    for m in JOIN_TABLE_PATTERN.finditer(sql or ""):
+        name = _normalize_table_token(m.group(1) or m.group(2) or "")
+        if name:
+            tables.add(name)
+    return tables
 
 
 def _validate_user_id_literals_match_session(sql: str, user_id: str) -> None:
@@ -155,7 +179,6 @@ def execute_user_scoped_sql(sql: str, user_id: str) -> list[dict[str, Any]]:
         raise ValueError(f"table_not_allowed:{table}")
     if ";" in sql:
         raise ValueError("multi_statement_not_allowed")
-
     _validate_user_id_literals_match_session(sql, user_id)
 
     scoped_sql, params = _enforce_user_scope(sql, table, user_id)

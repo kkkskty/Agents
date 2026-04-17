@@ -94,12 +94,15 @@ def unpaid_order_ids_from_rows(rows: list[Any]) -> list[str]:
     out: list[str] = []
     for r in rows:
         d = dict(r)
-        if "status" not in d or "id" not in d:
+        if "status" not in d:
             continue
         st = str(d.get("status") or "").strip().lower()
         if st not in UNPAID_ORDER_STATUSES:
             continue
+        # 兼容 SQL 别名：订单主键可能是 id，也可能被命名为 order_id。
         oid = d.get("id")
+        if oid is None:
+            oid = d.get("order_id")
         if oid is None:
             continue
         s = str(oid)
@@ -127,9 +130,13 @@ def build_citation_snippets(rows: list[dict[str, Any]], limit: int = 5) -> list[
 
 
 def build_search_task_outputs(rows: list[dict[str, Any]]) -> dict[str, Any]:
-    """从主查询结果行推断 task_context.outputs（无数据库比价）。"""
+    """从主查询结果行推断 task_context.outputs（无数据库比价）。
+
+    协议字段：unpaid_order_ids、proposed_order_items、order_items_by_order_id。
+    """
     unpaid = unpaid_order_ids_from_rows(rows)
     proposed: list[dict[str, Any]] = []
+    order_items_by_order_id: dict[str, list[dict[str, Any]]] = {}
     seen_pid: set[int] = set()
     for r in rows:
         d = dict(r)
@@ -140,9 +147,11 @@ def build_search_task_outputs(rows: list[dict[str, Any]]) -> dict[str, Any]:
             ipid = None
         name = d.get("product_name") or d.get("name") or d.get("item_name")
         label = str(name).strip() if name is not None else ""
-        if not label and ipid is not None:
-            label = f"商品#{ipid}"
-        if not label and ipid is None:
+        oid_raw = d.get("order_id")
+        oid_s = str(oid_raw).strip() if oid_raw is not None else ""
+        # 仅接受真实商品名称（如 products.name / item_name）。
+        # 若只有 product_id 无名称，则交给后续补查流程（order_items + products）填充，避免前端展示“商品#ID”占位名。
+        if not label:
             continue
         if ipid is not None and ipid in seen_pid:
             continue
@@ -156,6 +165,17 @@ def build_search_task_outputs(rows: list[dict[str, Any]]) -> dict[str, Any]:
         item: dict[str, Any] = {"item_name": label, "quantity": qty}
         if ipid is not None:
             item["product_id"] = ipid
+        if oid_s:
+            item["order_id"] = oid_s
+            line = {"item_name": label, "quantity": str(qty)}
+            if ipid is not None:
+                line["product_id"] = ipid
+            bucket = order_items_by_order_id.setdefault(oid_s, [])
+            sig = (line.get("product_id"), line["item_name"], line["quantity"])
+            if not any(
+                (x.get("product_id"), x.get("item_name"), str(x.get("quantity"))) == sig for x in bucket
+            ):
+                bucket.append(line)
         proposed.append(item)
     return {
         "ordered_items": [],
@@ -163,4 +183,5 @@ def build_search_task_outputs(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "drop_items": [],
         "proposed_order_items": proposed[:20],
         "unpaid_order_ids": unpaid,
+        "order_items_by_order_id": order_items_by_order_id,
     }

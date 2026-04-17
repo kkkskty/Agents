@@ -404,6 +404,175 @@ button:disabled {
   font-size: 0.95rem;
 }
 
+.bubble-content--rich {
+  white-space: normal;
+}
+
+.bubble-text {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* 订单待确认消息（卡片化） */
+.order-confirm-rich {
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+}
+
+.order-confirm-intro {
+  align-self: flex-start;
+  padding: 0.28rem 0.65rem;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: var(--primary);
+  background: var(--primary-soft);
+}
+
+.order-confirm-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+}
+
+.order-confirm-main-title {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 800;
+  letter-spacing: 0.02em;
+  color: var(--text);
+}
+
+.order-confirm-section {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  background: color-mix(in srgb, var(--surface-2) 65%, transparent);
+}
+
+.order-confirm-section-head {
+  padding: 0.45rem 0.7rem;
+  font-size: 0.8rem;
+  font-weight: 700;
+  color: var(--primary);
+  background: color-mix(in srgb, var(--surface) 88%, transparent);
+  border-bottom: 1px solid var(--border);
+}
+
+.order-confirm-section-body {
+  padding: 0.55rem 0.65rem;
+  font-size: 0.875rem;
+}
+
+.order-confirm-product {
+  display: flex;
+  gap: 0.45rem;
+  align-items: flex-start;
+  padding: 0.38rem 0;
+  border-bottom: 1px dashed color-mix(in srgb, var(--border) 95%, transparent);
+}
+
+.order-confirm-product:last-child {
+  border-bottom: none;
+}
+
+.order-confirm-dot {
+  flex-shrink: 0;
+  font-weight: 900;
+  color: var(--primary);
+  line-height: 1.35;
+}
+
+.order-confirm-product-text {
+  flex: 1;
+  line-height: 1.45;
+}
+
+.order-confirm-kv {
+  margin: 0;
+  display: grid;
+  gap: 0.42rem;
+}
+
+.order-confirm-kv-row {
+  display: grid;
+  grid-template-columns: 6.5rem 1fr;
+  gap: 0.5rem;
+  align-items: baseline;
+}
+
+.order-confirm-kv-row dt {
+  margin: 0;
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.order-confirm-kv-row dd {
+  margin: 0;
+  word-break: break-word;
+}
+
+.order-confirm-plain {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.order-confirm-footer {
+  padding: 0.65rem 0.75rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid color-mix(in srgb, var(--primary) 28%, var(--border));
+  background: linear-gradient(
+    145deg,
+    color-mix(in srgb, var(--primary-soft) 75%, var(--surface)) 0%,
+    var(--surface) 100%
+  );
+}
+
+.order-confirm-footer-text {
+  margin: 0 0 0.55rem;
+  font-size: 0.88rem;
+  line-height: 1.55;
+  color: var(--text);
+}
+
+.order-confirm-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+}
+
+.order-confirm-btn.order-confirm-btn--chosen {
+  background: linear-gradient(
+    165deg,
+    color-mix(in srgb, var(--primary) 82%, #312e81) 0%,
+    var(--primary-hover) 100%
+  );
+  border-color: transparent;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.12);
+}
+
+.order-confirm-btn.order-confirm-btn--chosen-cancel {
+  border-color: color-mix(in srgb, var(--danger) 35%, var(--border));
+  background: color-mix(in srgb, var(--danger) 12%, var(--surface));
+  color: color-mix(in srgb, var(--danger) 85%, var(--text));
+}
+
+.order-confirm-btn.order-confirm-btn--busy {
+  opacity: 1;
+}
+
+.order-confirm-btn.order-confirm-btn--chosen:disabled,
+.order-confirm-btn.order-confirm-btn--chosen-cancel:disabled {
+  opacity: 1;
+}
+
+.btn-sm {
+  padding: 0.38rem 0.85rem;
+  font-size: 0.82rem;
+}
+
 .chat-composer-wrap {
   position: sticky;
   bottom: 0;
@@ -425,11 +594,98 @@ button:disabled {
   display: flex;
   gap: 0.65rem;
   align-items: flex-end;
+  flex-wrap: wrap;
   background: var(--surface);
   border: 1px solid var(--border);
   border-radius: var(--radius);
   padding: 0.65rem 0.65rem 0.65rem 0.85rem;
   box-shadow: var(--shadow);
+}
+
+.order-fill-form {
+  width: 100%;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.75rem;
+  background: var(--surface-2);
+}
+
+.order-fill-header {
+  display: flex;
+  flex-direction: column;
+  gap: 0.15rem;
+  margin-bottom: 0.6rem;
+}
+
+.order-fill-header strong {
+  font-size: 0.92rem;
+}
+
+.order-fill-header span {
+  color: var(--text-muted);
+  font-size: 0.82rem;
+}
+
+.detected-items {
+  margin-bottom: 0.65rem;
+  padding: 0.55rem 0.65rem;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+
+.detected-items-title {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  font-weight: 700;
+  margin-bottom: 0.35rem;
+}
+
+.detected-item-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 0.5rem;
+  font-size: 0.88rem;
+  align-items: center;
+}
+
+.detected-item-row + .detected-item-row {
+  margin-top: 0.2rem;
+}
+
+.detected-item-qty {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+}
+
+.detected-item-qty .field-input {
+  width: 80px;
+  padding: 0.35rem 0.45rem;
+}
+
+.order-fill-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 0.6rem;
+}
+
+.order-fill-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+}
+
+.order-fill-field span {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  font-weight: 600;
+}
+
+.order-fill-actions {
+  margin-top: 0.7rem;
+  display: flex;
+  justify-content: flex-end;
 }
 
 .composer-input {

@@ -10,17 +10,19 @@ import { useAuth } from '../context/AuthContext'
 import { loadMessages, saveMessages } from '../lib/chatStorage'
 import {
   appendConversationMessage,
+  cancelOrderFlow,
   createConversation,
   deleteAllConversations,
-  finalizeOrderFlow,
   fetchHealth,
   getApiBase,
   getConversationMessages,
   listConversations,
   requestAssistantReply,
+  submitOrderConfirm,
+  submitOrderFields,
   storedMessageToChatMessage,
 } from '../lib/chatApi'
-import type { ChatMessage } from '../types/chat'
+import type { ChatMessage, OrderFillFieldsAction, PendingAction } from '../types/chat'
 import { MessageList } from '../components/MessageList'
 import { SuggestedPrompts } from '../components/SuggestedPrompts'
 import type { SuggestedPrompt } from '../constants/suggestedPrompts'
@@ -43,9 +45,91 @@ export function ChatPage() {
   const [sending, setSending] = useState(false)
   const [sendError, setSendError] = useState<string | null>(null)
   const [agentSessionId, setAgentSessionId] = useState<string | null>(null)
-  const [pendingOrderLink, setPendingOrderLink] = useState<string | null>(null)
+  const [pendingOrderFormAction, setPendingOrderFormAction] = useState<OrderFillFieldsAction | null>(null)
+  const [orderFormValues, setOrderFormValues] = useState<Record<string, string>>({})
+  const [detectedOrderItems, setDetectedOrderItems] = useState<Array<{ item_name: string; quantity: string }>>([])
+  const [detectedCancelOrderIds, setDetectedCancelOrderIds] = useState<string[]>([])
+  /** 订单确认气泡内按钮：每条消息仅能成功选择一次 */
+  const [orderConfirmChoice, setOrderConfirmChoice] = useState<
+    Record<string, 'confirm' | 'cancel'>
+  >({})
+  const [orderConfirmSubmitting, setOrderConfirmSubmitting] = useState<{
+    messageId: string
+    side: 'confirm' | 'cancel'
+  } | null>(null)
+  const orderConfirmInFlightRef = useRef<Set<string>>(new Set())
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const bottomRef = useRef<HTMLDivElement>(null)
+
+  const pickOrderFillAction = (actions?: PendingAction[]): OrderFillFieldsAction | null => {
+    if (!Array.isArray(actions)) return null
+    const hit = actions.find(
+      (a) =>
+        !!a &&
+        typeof a === 'object' &&
+        'type' in a &&
+        (a as { type?: string }).type === 'order_fill_fields',
+    )
+    if (!hit || typeof hit !== 'object') return null
+    const cand = hit as Partial<OrderFillFieldsAction>
+    if (!Array.isArray(cand.required_fields)) return null
+    const normalizeFields = (fields?: Array<{ key: string; label?: string }>) =>
+      (Array.isArray(fields) ? fields : [])
+        .filter((f) => !!f && typeof f.key === 'string')
+        .map((f) => ({ key: f.key, label: f.label || f.key }))
+    return {
+      type: 'order_fill_fields',
+      task_id: cand.task_id,
+      operation: cand.operation,
+      required_fields: normalizeFields(cand.required_fields),
+      display_fields: normalizeFields(cand.display_fields),
+      readonly_fields: normalizeFields(cand.readonly_fields),
+      prefill: cand.prefill ?? {},
+      hint: cand.hint,
+    }
+  }
+
+  const pickDetectedItems = (
+    action: OrderFillFieldsAction | null,
+  ): Array<{ item_name: string; quantity: string }> => {
+    if (!action?.prefill || typeof action.prefill !== 'object') return []
+    const prefill = action.prefill as Record<string, unknown>
+    const raw = prefill.items
+    if (Array.isArray(raw)) {
+      const normalized = raw
+        .map((it) => {
+          if (!it || typeof it !== 'object') return null
+          const name = String((it as Record<string, unknown>).item_name ?? '').trim()
+          const qty = String((it as Record<string, unknown>).quantity ?? '').trim() || '1'
+          if (!name) return null
+          return { item_name: name, quantity: qty }
+        })
+        .filter((x): x is { item_name: string; quantity: string } => !!x)
+      if (normalized.length > 0) return normalized
+    }
+    // 兜底：后端仅下发 item_name/quantity 时，仍构造单条清单用于前端展示。
+    const name = String(prefill.item_name ?? '').trim()
+    if (!name) return []
+    const qty = String(prefill.quantity ?? '').trim() || '1'
+    return [{ item_name: name, quantity: qty }]
+  }
+
+  const pickDetectedCancelOrderIds = (action: OrderFillFieldsAction | null): string[] => {
+    if (!action?.prefill || typeof action.prefill !== 'object') return []
+    const raw = (action.prefill as Record<string, unknown>).cancel_order_ids
+    if (Array.isArray(raw)) {
+      return raw
+        .map((x) => String(x ?? '').trim())
+        .filter((x, i, arr) => !!x && arr.indexOf(x) === i)
+    }
+    if (typeof raw === 'string') {
+      return raw
+        .split(',')
+        .map((x) => x.trim())
+        .filter((x, i, arr) => !!x && arr.indexOf(x) === i)
+    }
+    return []
+  }
 
   useEffect(() => {
     let cancelled = false
@@ -158,15 +242,33 @@ export function ChatPage() {
         }
 
         const history = [...messages, userMsg]
-        const { reply, citations, sessionId, actionRequired, orderLink } = await requestAssistantReply(history, {
+        const { reply, citations, sessionId, actionRequired, orderLink, pendingActions } = await requestAssistantReply(history, {
           userUsername: username,
           sessionId: agentSessionId ?? undefined,
         })
         if (sessionId) setAgentSessionId(sessionId)
-        if (actionRequired === 'click_order_link_confirm' && orderLink) {
-          setPendingOrderLink(orderLink)
+        void actionRequired
+        void orderLink
+        const orderFillAction = pickOrderFillAction(pendingActions)
+        if (orderFillAction) {
+          setPendingOrderFormAction(orderFillAction)
+          setDetectedOrderItems(pickDetectedItems(orderFillAction))
+          setDetectedCancelOrderIds(pickDetectedCancelOrderIds(orderFillAction))
+          const mergedPrefill: Record<string, string> = {}
+          const formFields =
+            orderFillAction.display_fields && orderFillAction.display_fields.length > 0
+              ? orderFillAction.display_fields
+              : orderFillAction.required_fields
+          for (const f of formFields) {
+            const value = orderFillAction.prefill?.[f.key]
+            mergedPrefill[f.key] = typeof value === 'string' ? value : ''
+          }
+          setOrderFormValues(mergedPrefill)
         } else {
-          setPendingOrderLink(null)
+          setPendingOrderFormAction(null)
+          setDetectedOrderItems([])
+          setDetectedCancelOrderIds([])
+          setOrderFormValues({})
         }
         const assistantMsg: ChatMessage = {
           id: newId(),
@@ -203,6 +305,10 @@ export function ChatPage() {
     }
   }
 
+  const orderFormReadonlyKeys = new Set(
+    (pendingOrderFormAction?.readonly_fields ?? []).map((x) => x.key),
+  )
+
   function onPickPrompt(p: SuggestedPrompt) {
     setInput(p.text)
     textareaRef.current?.focus()
@@ -225,17 +331,119 @@ export function ChatPage() {
       setConversationId(null)
     }
     setAgentSessionId(null)
-    setPendingOrderLink(null)
+    setPendingOrderFormAction(null)
+    setDetectedOrderItems([])
+    setDetectedCancelOrderIds([])
+    setOrderFormValues({})
+    setOrderConfirmChoice({})
+    setOrderConfirmSubmitting(null)
+    orderConfirmInFlightRef.current.clear()
   }
 
-  async function onFinishOrderFlow() {
+  const handleOrderConfirm = useCallback(
+    async (messageId: string, confirm: boolean) => {
+      if (orderConfirmInFlightRef.current.has(messageId)) return
+      const api = getApiBase()
+      if (!api || !agentSessionId) {
+        setSendError('当前会话未就绪，无法确认订单。')
+        return
+      }
+      orderConfirmInFlightRef.current.add(messageId)
+      setSendError(null)
+      setOrderConfirmSubmitting({ messageId, side: confirm ? 'confirm' : 'cancel' })
+      try {
+        const result = await submitOrderConfirm(api, {
+          sessionId: agentSessionId,
+          userId: username,
+          confirm,
+        })
+        setOrderConfirmChoice((prev) => {
+          if (prev[messageId]) return prev
+          return { ...prev, [messageId]: confirm ? 'confirm' : 'cancel' }
+        })
+        const assistantMsg: ChatMessage = {
+          id: newId(),
+          role: 'assistant',
+          content: result.message,
+          createdAt: Date.now(),
+        }
+        setMessages((h) => [...h, assistantMsg])
+        const orderFillAction = pickOrderFillAction(result.pending_actions)
+        if (orderFillAction) {
+          setPendingOrderFormAction(orderFillAction)
+          setDetectedOrderItems(pickDetectedItems(orderFillAction))
+          setDetectedCancelOrderIds(pickDetectedCancelOrderIds(orderFillAction))
+          const mergedPrefill: Record<string, string> = {}
+          const formFields =
+            orderFillAction.display_fields && orderFillAction.display_fields.length > 0
+              ? orderFillAction.display_fields
+              : orderFillAction.required_fields
+          for (const f of formFields) {
+            const value = orderFillAction.prefill?.[f.key]
+            mergedPrefill[f.key] = typeof value === 'string' ? value : ''
+          }
+          setOrderFormValues(mergedPrefill)
+        } else {
+          setPendingOrderFormAction(null)
+          setDetectedOrderItems([])
+          setDetectedCancelOrderIds([])
+          setOrderFormValues({})
+        }
+        if (serverMode === 'on' && conversationId) {
+          await appendConversationMessage(api, conversationId, username, 'assistant', result.message)
+        }
+      } catch (e) {
+        setSendError(e instanceof Error ? e.message : '订单确认失败')
+      } finally {
+        orderConfirmInFlightRef.current.delete(messageId)
+        setOrderConfirmSubmitting(null)
+      }
+    },
+    [
+      agentSessionId,
+      username,
+      serverMode,
+      conversationId,
+    ],
+  )
+
+  function onChangeOrderField(key: string, value: string) {
+    setOrderFormValues((prev) => ({ ...prev, [key]: value }))
+  }
+
+  function onChangeDetectedItemQuantity(index: number, quantity: string) {
+    setDetectedOrderItems((prev) =>
+      prev.map((it, i) => (i === index ? { ...it, quantity } : it)),
+    )
+  }
+
+  async function onSubmitOrderForm() {
+    if (!pendingOrderFormAction || sending) return
     const api = getApiBase()
-    if (!api || !agentSessionId) return
+    if (!api || !agentSessionId) {
+      setSendError('当前会话未就绪，无法提交订单表单。')
+      return
+    }
+    setSendError(null)
+    setSending(true)
     try {
-      const result = await finalizeOrderFlow(api, {
+      const fields: Record<string, string> = {}
+      const formFields =
+        pendingOrderFormAction.display_fields && pendingOrderFormAction.display_fields.length > 0
+          ? pendingOrderFormAction.display_fields
+          : pendingOrderFormAction.required_fields
+      for (const f of formFields) {
+        fields[f.key] = (orderFormValues[f.key] ?? '').trim()
+      }
+      const normalizedItems = detectedOrderItems.map((it) => ({
+        item_name: it.item_name,
+        quantity: (it.quantity ?? '').trim() || '1',
+      }))
+      const result = await submitOrderFields(api, {
         sessionId: agentSessionId,
         userId: username,
-        clickConfirmed: true,
+        fields,
+        items: normalizedItems,
       })
       const assistantMsg: ChatMessage = {
         id: newId(),
@@ -244,9 +452,67 @@ export function ChatPage() {
         createdAt: Date.now(),
       }
       setMessages((h) => [...h, assistantMsg])
-      setPendingOrderLink(null)
+      void result.action_required
+      void result.order_link
+      const orderFillAction = pickOrderFillAction(result.pending_actions)
+      if (orderFillAction) {
+        setPendingOrderFormAction(orderFillAction)
+        setDetectedOrderItems(pickDetectedItems(orderFillAction))
+        setDetectedCancelOrderIds(pickDetectedCancelOrderIds(orderFillAction))
+        const mergedPrefill: Record<string, string> = {}
+        const formFields =
+          orderFillAction.display_fields && orderFillAction.display_fields.length > 0
+            ? orderFillAction.display_fields
+            : orderFillAction.required_fields
+        for (const f of formFields) {
+          const value = orderFillAction.prefill?.[f.key]
+          mergedPrefill[f.key] = typeof value === 'string' ? value : ''
+        }
+        setOrderFormValues(mergedPrefill)
+      } else {
+        setPendingOrderFormAction(null)
+        setDetectedOrderItems([])
+        setDetectedCancelOrderIds([])
+        setOrderFormValues({})
+      }
+      if (serverMode === 'on' && conversationId) {
+        await appendConversationMessage(api, conversationId, username, 'assistant', result.message)
+      }
     } catch (e) {
-      setSendError(e instanceof Error ? e.message : '订单确认失败')
+      setSendError(e instanceof Error ? e.message : '提交订单信息失败')
+    } finally {
+      setSending(false)
+    }
+  }
+
+  async function onCancelOrderFlow() {
+    const api = getApiBase()
+    if (!api || !agentSessionId || sending) return
+    setSendError(null)
+    setSending(true)
+    try {
+      const result = await cancelOrderFlow(api, {
+        sessionId: agentSessionId,
+        userId: username,
+      })
+      const assistantMsg: ChatMessage = {
+        id: newId(),
+        role: 'assistant',
+        content: result.message,
+        createdAt: Date.now(),
+      }
+      setMessages((h) => [...h, assistantMsg])
+      setPendingOrderFormAction(null)
+      setDetectedOrderItems([])
+      setDetectedCancelOrderIds([])
+      setOrderFormValues({})
+      if (serverMode === 'on' && conversationId) {
+        await appendConversationMessage(api, conversationId, username, 'assistant', result.message)
+      }
+    } catch (e) {
+      setSendError(e instanceof Error ? e.message : '取消订单流程失败')
+    } finally {
+      setSending(false)
     }
   }
 
@@ -303,7 +569,12 @@ export function ChatPage() {
               <SuggestedPrompts onPick={onPickPrompt} disabled={sending} />
             </div>
           ) : (
-            <MessageList messages={messages} />
+            <MessageList
+              messages={messages}
+              orderConfirmChoice={orderConfirmChoice}
+              orderConfirmSubmitting={orderConfirmSubmitting}
+              onOrderConfirm={handleOrderConfirm}
+            />
           )}
           <div ref={bottomRef} />
         </div>
@@ -317,18 +588,80 @@ export function ChatPage() {
             </p>
           ) : null}
           <div className="composer-row">
-            {pendingOrderLink ? (
-              <div className="composer-order-actions">
-                <a href={pendingOrderLink} target="_blank" rel="noreferrer">
-                  打开订单结果链接
-                </a>
-                <button
-                  type="button"
-                  className="btn btn-outline"
-                  onClick={() => void onFinishOrderFlow()}
-                >
-                  我已点击并确认，结束流程
-                </button>
+            {pendingOrderFormAction ? (
+              <div className="order-fill-form">
+                <div className="order-fill-header">
+                  <strong>请补全订单信息</strong>
+                  <span>{pendingOrderFormAction.hint || '请填写以下必填项后继续。'}</span>
+                </div>
+                {detectedOrderItems.length > 0 ? (
+                  <div className="detected-items">
+                    <div className="detected-items-title">已从依赖任务识别到商品清单（可修改数量）</div>
+                    {detectedOrderItems.map((it, idx) => (
+                      <div key={`${it.item_name}_${idx}`} className="detected-item-row">
+                        <span>{it.item_name}</span>
+                        <label className="detected-item-qty">
+                          <span>x</span>
+                          <input
+                            className="field-input"
+                            value={it.quantity}
+                            onChange={(ev) => onChangeDetectedItemQuantity(idx, ev.target.value)}
+                            disabled={sending}
+                          />
+                        </label>
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+                {detectedCancelOrderIds.length > 0 ? (
+                  <div className="detected-items">
+                    <div className="detected-items-title">已从依赖任务识别到订单号</div>
+                    {detectedCancelOrderIds.map((oid) => (
+                      <div key={oid} className="detected-item-row">
+                        <span>{oid}</span>
+                      </div>
+                    ))}
+                  </div>
+                ) : null}
+                <div className="order-fill-grid">
+                  {(pendingOrderFormAction.display_fields && pendingOrderFormAction.display_fields.length > 0
+                    ? pendingOrderFormAction.display_fields
+                    : pendingOrderFormAction.required_fields
+                  )
+                    .filter((f) => {
+                      // 有多条已识别商品时，商品名称/数量由上方清单承载，避免下方单条输入造成歧义。
+                      if (detectedOrderItems.length > 0 && (f.key === 'item_name' || f.key === 'quantity')) {
+                        return false
+                      }
+                      return true
+                    })
+                    .map((f) => (
+                    <label key={f.key} className="order-fill-field">
+                      <span>{f.label || f.key}</span>
+                      <input
+                        className="field-input"
+                        value={orderFormValues[f.key] ?? ''}
+                        onChange={(ev) => onChangeOrderField(f.key, ev.target.value)}
+                        placeholder={`请输入${f.label || f.key}`}
+                        disabled={
+                          sending ||
+                          orderFormReadonlyKeys.has(f.key) ||
+                          (f.key === 'order_id' &&
+                            (pendingOrderFormAction.operation === 'cancel' ||
+                              pendingOrderFormAction.operation === 'modify'))
+                        }
+                      />
+                    </label>
+                  ))}
+                </div>
+                <div className="order-fill-actions">
+                  <button type="button" className="btn btn-outline" disabled={sending} onClick={() => void onCancelOrderFlow()}>
+                    取消订单流程
+                  </button>
+                  <button type="button" className="btn btn-primary" disabled={sending} onClick={() => void onSubmitOrderForm()}>
+                    {sending ? '提交中…' : '提交订单信息'}
+                  </button>
+                </div>
               </div>
             ) : null}
             <textarea
@@ -339,13 +672,13 @@ export function ChatPage() {
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={onKeyDown}
-              disabled={sending || serverMode === 'loading'}
+              disabled={sending || serverMode === 'loading' || !!pendingOrderFormAction}
               aria-label="向智能客服输入问题"
             />
             <button
               type="submit"
               className="btn btn-primary composer-send"
-              disabled={sending || !input.trim() || serverMode === 'loading'}
+              disabled={sending || !input.trim() || serverMode === 'loading' || !!pendingOrderFormAction}
             >
               {sending ? '发送中…' : '发送'}
             </button>

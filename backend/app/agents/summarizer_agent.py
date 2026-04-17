@@ -1,24 +1,36 @@
+"""多子任务汇总：按意图拼装回复，并写入 citations / pending_actions / debug_trace。"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
 from typing import Any
 
+from app.chains.order_validation import merge_debug_trace
 from app.core.llm_provider import LLMRouter
 from app.core.settings import load_settings
 from app.core.state import AgentResult
 
+# -----------------------------------------------------------------------------
+# Citations（去重聚合）
+# -----------------------------------------------------------------------------
+
+_CitationKey = tuple[str, int, str]
+
 
 def _collect_task_citations(state: dict[str, Any], task_id: str) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
-    seen: set[tuple[str, int, str]] = set()
+    seen: set[_CitationKey] = set()
 
-    def _push(c: dict[str, Any]) -> None:
+    def push(c: dict[str, Any]) -> None:
         source = str(c.get("source") or "unknown")
         chunk_id = int(c.get("chunk_id") or 0)
         snippet = str(c.get("snippet") or "").strip()
         if not snippet:
             return
-        k = (source, chunk_id, snippet)
-        if k in seen:
+        key: _CitationKey = (source, chunk_id, snippet)
+        if key in seen:
             return
-        seen.add(k)
+        seen.add(key)
         out.append({"source": source, "chunk_id": chunk_id, "snippet": snippet})
 
     runtime = state["runtime"]
@@ -26,21 +38,22 @@ def _collect_task_citations(state: dict[str, Any], task_id: str) -> list[dict[st
     ctx = runtime["task_context"].get(task_id)
     if isinstance(ctx, dict):
         for key in ("citations", "sql_citations", "rag_selected_citations"):
-            for c in (ctx.get(key) or []):
+            for c in ctx.get(key) or []:
                 if isinstance(c, dict):
-                    _push(c)
+                    push(c)
 
-    for rec in (trace["sql_query_trace"].records or []):
+    for rec in trace["sql_query_trace"].records or []:
         if rec.task_id == task_id:
-            for c in (rec.citations or []):
+            for c in rec.citations or []:
                 if isinstance(c, dict):
-                    _push(c)
+                    push(c)
 
-    for rec in (trace["rag_trace"].records or []):
+    for rec in trace["rag_trace"].records or []:
         if rec.task_id == task_id:
-            for c in (rec.selected_citations or []):
+            for c in rec.selected_citations or []:
                 if isinstance(c, dict):
-                    _push(c)
+                    push(c)
+
     return out
 
 
@@ -74,13 +87,8 @@ def _fallback_answer_from_citations(question: str, citations: list[dict[str, Any
 
     scored: list[tuple[int, str]] = []
     for p in candidates:
-        score = 0
-        for tk in q_tokens:
-            if tk and tk in p:
-                score += 2
-        for kw in ("步骤", "处理", "联系", "提交", "核查", "转人工", "失败", "规则"):
-            if kw in p:
-                score += 1
+        score = sum(2 for tk in q_tokens if tk and tk in p)
+        score += sum(1 for kw in ("步骤", "处理", "联系", "提交", "核查", "转人工", "失败", "规则") if kw in p)
         scored.append((score, p))
     scored.sort(key=lambda x: x[0], reverse=True)
 
@@ -100,23 +108,47 @@ def _fallback_answer_from_citations(question: str, citations: list[dict[str, Any
     return f"结合检索证据，与你的问题最相关的要点是：{'；'.join(picked)}。"
 
 
+# -----------------------------------------------------------------------------
+# SQL 结果改写（LLM）
+# -----------------------------------------------------------------------------
+
 _MAX_QUERY_SYNTH_BODY = 4500
+
+_SQL_SKIP_PHRASES = (
+    "未查询到相关数据",
+    "查询执行失败",
+    "大模型未配置",
+    "无法生成查询",
+    "大模型生成的 SQL 不可用",
+)
 
 
 def _should_skip_sql_llm_rewrite(task_status: str, query_message: str) -> bool:
-    """失败、无数据或明显错误文案时不走总结模型，避免编造条数与商品名。"""
     if task_status != "ok":
         return True
     qm = (query_message or "").strip()
     if not qm:
         return True
-    if "未查询到相关数据" in qm:
-        return True
-    if "查询执行失败" in qm or "大模型未配置" in qm or "无法生成查询" in qm:
-        return True
-    if "大模型生成的 SQL 不可用" in qm:
-        return True
-    return False
+    return any(p in qm for p in _SQL_SKIP_PHRASES)
+
+
+# -----------------------------------------------------------------------------
+# Summarizer
+# -----------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class _SubtaskView:
+    """单个子任务在汇总时需要的只读视图。"""
+
+    task_id: str
+    question: str
+    intent: str
+    status: str
+    message: str
+    outputs: dict[str, Any]
+    citations: list[dict[str, Any]]
+    result_row: dict[str, Any]
 
 
 class SummarizerAgent:
@@ -132,11 +164,12 @@ class SummarizerAgent:
         query_message: str,
         task_status: str,
     ) -> str:
-        """把「查询结果罗列」改写成先答用户所问、再附精简明细；失败则退回原文。"""
         qm = (query_message or "").strip()
         if _should_skip_sql_llm_rewrite(task_status, qm):
             return qm or "未获取到查询结果。"
-        body = qm if len(qm) <= _MAX_QUERY_SYNTH_BODY else qm[:_MAX_QUERY_SYNTH_BODY] + "\n…（以下略）"
+        body = (
+            qm if len(qm) <= _MAX_QUERY_SYNTH_BODY else qm[:_MAX_QUERY_SYNTH_BODY] + "\n…（以下略）"
+        )
         prompt = (
             "你是电商数据客服。下面「查询结果」来自数据库 SELECT，是客观事实。\n"
             "请按用户真正关心的问题组织回答，禁止只罗列编号条目而不作答。\n"
@@ -196,97 +229,68 @@ class SummarizerAgent:
             pass
         return fallback
 
-    def summarize_with_state(self, state) -> dict:
-        runtime = state["runtime"]
-        trace = state["trace"]
-        current_user_text = (runtime["text"] or "").strip()
+    def _answer_for_subtask(self, st: _SubtaskView, *, user_text: str) -> str:
+        q = st.question
+        intent = st.intent
+        status = st.status
+        msg = st.message
+        outputs = st.outputs
+        citations = st.citations
+        tr = st.result_row
 
-        tasks = runtime["sub_tasks"]
-        task_results = runtime["task_results"]
-        result_map = {str(t.get("task_id", "")): t for t in task_results}
-        merged_citations: list[dict[str, Any]] = []
-        lines: list[str] = []
+        if intent == "session_meta":
+            return msg
 
-        if not tasks and "raw" in runtime:
-            raw = runtime["raw"]
-            tasks = [type("TmpTask", (), {"id": "task_0", "text": runtime["text"], "intent": raw.route})()]
-            result_map["task_0"] = {
-                "task_id": "task_0",
-                "intent": raw.route,
-                "status": raw.status,
-                "message": raw.message,
-                "error": raw.error,
-            }
-
-        for idx, task in enumerate(tasks, start=1):
-            tid = task.id
-            q = str(task.text or "").strip() or "（未提供）"
-            intent = str(task.intent or "unknown")
-            tr = result_map.get(tid, {})
-            status = str(tr.get("status", "unknown"))
-            msg = str(tr.get("message", "") or "")
-            tctx = runtime["task_context"].get(tid) or {}
-            outputs = tctx.get("outputs") if isinstance(tctx, dict) else {}
-            citations = _collect_task_citations(state, tid)
-            merged_citations.extend(citations)
-
-            if intent == "session_meta":
-                ans = msg
-            elif intent == "query":
-                # SQL 结果先经 SearchAgent 写入 message；再改写为「结论 + 明细」以贴合用户问法
-                if msg.strip():
-                    ans = self._synthesize_sql_answer(
-                        user_text=current_user_text,
-                        subtask_text=q,
-                        query_message=msg,
-                        task_status=status,
-                    )
-                else:
-                    ans = self._answer_from_outputs_and_citations(
-                        q,
-                        intent,
-                        outputs if isinstance(outputs, dict) else {},
-                        citations,
-                        current_user_text=current_user_text,
-                    )
-            elif intent == "rule":
-                if status in ("error", "failed"):
-                    ans = (msg or "").strip() or "规则检索失败，请稍后重试。"
-                elif status == "no_result" and not citations:
-                    ans = (msg or "").strip() or "未检索到相关规则。"
-                else:
-                    ans = self._answer_from_outputs_and_citations(
-                        q,
-                        intent,
-                        outputs if isinstance(outputs, dict) else {},
-                        citations,
-                        current_user_text=current_user_text,
-                    )
-            elif intent == "order":
-                order_link = tr.get("order_link") or ""
-                link_txt = f"，订单链接：{order_link}" if order_link else ""
-                ans = f"当前订单处理状态：{status}。{msg}{link_txt}"
-            elif intent == "handoff":
-                hs = str(tr.get("handoff_status") or "active")
-                ans = f"当前人工处理状态：{hs}。{msg}"
-            else:
-                ans = (msg or "").strip() or "未识别意图，请说明您是要查询信息、咨询规则，还是处理订单（下单/退单/修改）。"
-
-            use_plain = (
-                intent == "session_meta"
-                or (len(tasks) == 1 and intent == "query")
-                or (len(tasks) == 1 and intent == "rule")
-                or (
-                    len(tasks) == 1
-                    and intent == "order"
-                    and status in ("collecting_info", "awaiting_pre_confirm")
+        if intent == "query":
+            if msg.strip():
+                return self._synthesize_sql_answer(
+                    user_text=user_text,
+                    subtask_text=q,
+                    query_message=msg,
+                    task_status=status,
                 )
+            return self._answer_from_outputs_and_citations(
+                q, intent, outputs, citations, current_user_text=user_text
             )
-            if use_plain:
-                lines.append(ans)
-            else:
-                lines.append(f"针对问题{idx}：{q}：{ans}")
 
+        if intent == "rule":
+            if status in ("error", "failed"):
+                return (msg or "").strip() or "规则检索失败，请稍后重试。"
+            if status == "no_result" and not citations:
+                return (msg or "").strip() or "未检索到相关规则。"
+            return self._answer_from_outputs_and_citations(
+                q, intent, outputs, citations, current_user_text=user_text
+            )
+
+        if intent == "order":
+            order_link = tr.get("order_link") or ""
+            link_txt = f"，订单链接：{order_link}" if order_link else ""
+            return f"当前订单处理状态：{status}。{msg}{link_txt}"
+
+        if intent == "handoff":
+            hs = str(tr.get("handoff_status") or "active")
+            return f"当前人工处理状态：{hs}。{msg}"
+
+        return (msg or "").strip() or (
+            "未识别意图，请说明您是要查询信息、咨询规则，还是处理订单（下单/退单/修改）。"
+        )
+
+    @staticmethod
+    def _line_prefix_use_plain(
+        intent: str,
+        task_count: int,
+        status: str,
+    ) -> bool:
+        if intent == "session_meta":
+            return True
+        if task_count != 1:
+            return False
+        if intent in ("query", "rule"):
+            return True
+        return intent == "order" and status in ("collecting_info", "awaiting_pre_confirm")
+
+    @staticmethod
+    def _resolve_final_route(tasks: list[Any]) -> str:
         if len(tasks) == 1 and tasks[0].intent in {
             "query",
             "rule",
@@ -295,18 +299,87 @@ class SummarizerAgent:
             "unknown",
             "session_meta",
         }:
-            final_route = tasks[0].intent
-        elif len(tasks) > 1:
-            final_route = "unknown"
+            return tasks[0].intent
+        if len(tasks) > 1:
             for t in tasks:
                 if t.intent != "unknown":
-                    final_route = t.intent
-                    break
-        else:
-            final_route = "unknown"
-        if len(tasks) == 1:
-            only_tid = tasks[0].id
-            final_status = str(result_map.get(only_tid, {}).get("status", "ok"))
+                    return t.intent
+            return "unknown"
+        return "unknown"
+
+    @staticmethod
+    def _resolve_order_workflow_step(
+        trace: Any,
+        tasks: list[Any],
+        final_status: str,
+    ) -> str | None:
+        for rec in reversed(trace["order_trace"].records):
+            if rec.status:
+                return rec.status
+        if len(tasks) == 1 and tasks[0].intent == "order":
+            return final_status
+        return None
+
+    def summarize_with_state(self, state: dict[str, Any]) -> dict[str, Any]:
+        runtime = state["runtime"]
+        trace = state["trace"]
+        user_text = (runtime["text"] or "").strip()
+
+        tasks: list[Any] = list(runtime["sub_tasks"])
+        task_results = runtime["task_results"]
+        result_map: dict[str, dict[str, Any]] = {str(t.get("task_id", "")): t for t in task_results}
+
+        if not tasks and "raw" in runtime:
+            raw = runtime["raw"]
+            tasks = [
+                type(
+                    "_TmpTask",
+                    (),
+                    {"id": "task_0", "text": runtime["text"], "intent": raw.route},
+                )()
+            ]
+            result_map["task_0"] = {
+                "task_id": "task_0",
+                "intent": raw.route,
+                "status": raw.status,
+                "message": raw.message,
+                "error": raw.error,
+            }
+
+        merged_citations: list[dict[str, Any]] = []
+        lines: list[str] = []
+        n_tasks = len(tasks)
+
+        for idx, task in enumerate(tasks, start=1):
+            tid = task.id
+            tr = result_map.get(tid, {})
+            tctx = runtime["task_context"].get(tid) or {}
+            outputs = tctx.get("outputs") if isinstance(tctx, dict) else {}
+            if not isinstance(outputs, dict):
+                outputs = {}
+            citations = _collect_task_citations(state, tid)
+            merged_citations.extend(citations)
+
+            st = _SubtaskView(
+                task_id=tid,
+                question=str(task.text or "").strip() or "（未提供）",
+                intent=str(task.intent or "unknown"),
+                status=str(tr.get("status", "unknown")),
+                message=str(tr.get("message", "") or ""),
+                outputs=outputs,
+                citations=citations,
+                result_row=tr,
+            )
+            ans = self._answer_for_subtask(st, user_text=user_text)
+
+            if self._line_prefix_use_plain(st.intent, n_tasks, st.status):
+                lines.append(ans)
+            else:
+                lines.append(f"针对问题{idx}：{st.question}：{ans}")
+
+        final_route = self._resolve_final_route(tasks)
+        if n_tasks == 1:
+            final_status = str(result_map.get(tasks[0].id, {}).get("status", "ok"))
         else:
             final_status = "ok"
 
@@ -316,25 +389,34 @@ class SummarizerAgent:
             message="\n".join(lines),
             citations=merged_citations or None,
         )
+
         obs = trace["observability"]
         final_result.request_id = obs.request_id
-        order_step = None
-        for rec in reversed(trace["order_trace"].records):
-            if rec.status:
-                order_step = rec.status
-                break
-        if order_step is None and len(tasks) == 1 and tasks[0].intent == "order":
-            order_step = final_status
-        final_result.workflow_step = order_step
+        final_result.workflow_step = self._resolve_order_workflow_step(trace, tasks, final_status)
         final_result.handoff_status = "active" if any(t.intent == "handoff" for t in tasks) else "inactive"
-        final_result.debug_trace = {
+
+        obs_trace = {
             "node_timings": obs.node_timings,
             "node_logs": obs.node_logs,
             "errors": obs.errors,
         }
+        raw_agent = runtime.get("raw")
+        if isinstance(raw_agent, AgentResult) and raw_agent.debug_trace:
+            final_result.debug_trace = merge_debug_trace(obs_trace, raw_agent.debug_trace)
+        else:
+            final_result.debug_trace = obs_trace
+
+        if n_tasks == 1:
+            tid0 = tasks[0].id
+            err0 = result_map.get(tid0, {}).get("error")
+            final_result.error = err0 if err0 else (
+                raw_agent.error if isinstance(raw_agent, AgentResult) else None
+            )
+
         done = len(task_results)
-        total = len(tasks)
+        total = n_tasks
         final_result.sub_task_count = total
         final_result.sub_task_progress = f"{done}/{total}" if total else None
         final_result.pending_actions = runtime["pending_actions"]
+
         return {"runtime": {**runtime, "result": final_result}}

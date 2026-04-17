@@ -1,310 +1,76 @@
-import re
-
 from langchain_core.runnables import RunnableLambda
 
+from app.chains.order_field_config import (
+    FIELD_LABEL_ZH as ORDER_FIELD_LABEL_ZH,
+    MUTABLE_FIELDS_MODIFY,
+    display_fields_for,
+    required_fields_for as cfg_required_fields,
+)
+from app.chains.order_validation import (
+    MISSING_OPERATION,
+    MISSING_ORDER_OPERATION,
+    ORDER_API_FAILED,
+    ORDER_CANCELLED_BY_USER,
+    order_validation_debug_trace,
+)
+from app.chains import order_validators as ord_val
 from app.core.state import AgentResult, OrderContext
 from app.tools.order_tools import cancel_order, create_order, modify_order
 
 
 class OrderChain:
-    """订单子流程（无 LLM）：1 判动作 2 校验字段 3 缺则追问 4 齐则待确认 5 确认后调 API。"""
+    """订单子流程（无 LLM）：路由动作 → 确认/拦截 → 收集校验 → 待确认摘要 → 执行 API。"""
 
-    REQUIRED_FIELDS = {
-        "create": ["item_name", "quantity", "address", "contact_phone"],
-        "cancel": ["order_id", "reason"],
-        "modify": ["order_id", "field", "new_value"],
-    }
+    MODIFY_MUTABLE_FIELDS = MUTABLE_FIELDS_MODIFY
+    FIELD_LABEL_ZH = ORDER_FIELD_LABEL_ZH
 
-    FIELD_LABEL_ZH = {
-        "item_name": "商品名称",
-        "quantity": "数量",
-        "address": "收货地址",
-        "contact_phone": "联系电话",
-        "order_id": "订单号",
-        "reason": "退单原因",
-        "field": "要修改的信息项",
-        "new_value": "修改后的内容",
-    }
+    # -------------------------------------------------------------------------
+    # 对外入口
+    # -------------------------------------------------------------------------
+
+    @classmethod
+    def required_fields_for(cls, operation: str | None) -> list[str]:
+        return cfg_required_fields(operation)
+
+    @classmethod
+    def resolve_order_operation(
+        cls,
+        text: str,
+        hint: str | None,
+        persisted: str | None,
+    ) -> str | None:
+        return ord_val.resolve_order_operation(text, hint, persisted)
 
     def process_user_text(
         self, ctx: OrderContext, text: str, operation_hint: str | None = None
     ) -> AgentResult:
         chain = (
             RunnableLambda(
-                lambda payload: self._step_route_or_operation(
-                    payload["ctx"], payload["text"], payload.get("operation_hint")
+                lambda p: self._step_route_or_operation(
+                    p["ctx"], p["text"], p.get("operation_hint")
                 )
             )
             | RunnableLambda(self._step_handle_confirm_stage)
-            | RunnableLambda(self._step_block_if_executed)
+            | RunnableLambda(self._step_block_after_closed)
             | RunnableLambda(self._step_collect_and_validate)
             | RunnableLambda(self._step_prepare_pre_confirm)
         )
         return chain.invoke({"ctx": ctx, "text": text.strip(), "operation_hint": operation_hint})
 
-    def apply_pre_confirm(self, ctx: OrderContext, confirm: bool) -> AgentResult:
-        if ctx.status != "awaiting_pre_confirm":
-            return AgentResult(
-                route="order",
-                status=ctx.status,
-                message="当前不在执行前确认阶段，请先提供完整订单信息。",
-                action_required="provide_order_fields",
-            )
-        if not confirm:
-            ctx.status = "closed"
-            return AgentResult(
-                route="order", status="closed", message="已取消本次订单操作。"
-            )
-        return self.execute(ctx)
-
-    def execute(self, ctx: OrderContext) -> AgentResult:
-        if ctx.operation is None:
-            return AgentResult(
-                route="order", status="failed", message="未识别订单操作类型。", error="missing_operation"
-            )
-
-        if ctx.operation == "create":
-            payload = dict(ctx.fields)
-            if ctx.items:
-                payload["items"] = list(ctx.items)
-            result = create_order(payload)
-        elif ctx.operation == "cancel":
-            if ctx.cancel_order_ids:
-                messages: list[str] = []
-                last_link: str | None = None
-                all_ok = True
-                for oid in ctx.cancel_order_ids:
-                    r = cancel_order(
-                        {"order_id": str(oid), "reason": ctx.fields.get("reason", "用户申请取消")}
-                    )
-                    if r.get("ok"):
-                        messages.append(str(r.get("message", "")))
-                        last_link = r.get("order_link") or last_link
-                    else:
-                        all_ok = False
-                        ctx.failure_reason = r.get("reason", "未知错误")
-                        break
-                if not all_ok:
-                    ctx.status = "failed"
-                    return AgentResult(
-                        route="order",
-                        status=ctx.status,
-                        message=f"{self._op_zh(ctx.operation)}失败：{ctx.failure_reason}",
-                        error=ctx.failure_reason,
-                    )
-                ctx.status = "executed_waiting_click"
-                ctx.order_link = last_link
-                return AgentResult(
-                    route="order",
-                    status=ctx.status,
-                    message=f"已处理 {len(ctx.cancel_order_ids)} 笔订单取消申请。"
-                    f" {' '.join(messages[:3])}"
-                    f"{' …' if len(messages) > 3 else ''} 请点击链接确认后结束流程。",
-                    action_required="click_order_link_confirm",
-                    order_link=ctx.order_link,
-                )
-            result = cancel_order(ctx.fields)
-        else:
-            result = modify_order(ctx.fields)
-
-        if not result.get("ok"):
-            ctx.status = "failed"
-            ctx.failure_reason = result.get("reason", "未知错误")
-            return AgentResult(
-                route="order",
-                status=ctx.status,
-                message=f"{self._op_zh(ctx.operation)}失败：{ctx.failure_reason}",
-                error=ctx.failure_reason,
-            )
-
-        ctx.status = "executed_waiting_click"
-        ctx.order_link = result.get("order_link")
-        return AgentResult(
-            route="order",
-            status=ctx.status,
-            message=f"{result.get('message')} 请点击链接确认后结束流程。",
-            action_required="click_order_link_confirm",
-            order_link=ctx.order_link,
-        )
-
-    def finalize(self, ctx: OrderContext, _clicked: bool) -> AgentResult:
-        """执行结果已就绪后收尾：到此结束，不再要求额外交互确认（保留参数以兼容 API）。"""
-        if ctx.status != "executed_waiting_click":
-            return AgentResult(
-                route="order", status=ctx.status, message="当前无可确认的订单流程。"
-            )
-        ctx.status = "closed"
-        return AgentResult(
-            route="order",
-            status="closed",
-            message="操作已完成，对应订单链接如下，请点击查看。",
-            order_link=ctx.order_link,
-        )
-
-    def _missing_fields(self, ctx: OrderContext) -> list[str]:
-        required = list(self.REQUIRED_FIELDS.get(ctx.operation or "", []))
-        if ctx.operation == "create" and ctx.items:
-            required = [field for field in required if field not in {"item_name", "quantity"}]
-        if ctx.operation == "cancel" and ctx.cancel_order_ids:
-            # 订单号来自依赖任务，仅需用户补充退单原因
-            required = ["reason"]
-        return [field for field in required if not str(ctx.fields.get(field) or "").strip()]
-
-    def _parse_supplement_fields(self, ctx: OrderContext, text: str) -> None:
-        """解析用户本轮补充的「标签:值」文本写入 ctx.fields（收集阶段）；兼容半角/全角冒号。"""
-        norm = text.replace("\n", " ").replace("\t", " ").strip()
-
-        def _digits(s: str) -> str:
-            return re.sub(r"\D", "", s)
-
-        if ctx.operation == "create":
-            # 先直配地址/电话（不依赖复杂 lookahead，避免「同一行两键值」漏匹配）
-            if not str(ctx.fields.get("address") or "").strip():
-                am = re.search(
-                    r"(?:收货地址|收获地址|地址|address)\s*[：:]\s*(.+?)(?=(?:\s|^)(?:联系电话|联系方式|手机|手机号|电话|phone)\s*[：:]|$)",
-                    norm,
-                    re.IGNORECASE | re.DOTALL,
-                )
-                if am:
-                    ctx.fields["address"] = am.group(1).strip().rstrip(" ，,;；")
-            if not str(ctx.fields.get("contact_phone") or "").strip():
-                # 捕获段至少 1 个字符；此前 {4,40} 会导致「124」等 3 位无法匹配
-                pm = re.search(
-                    r"(?:联系电话|联系方式|手机|手机号|电话|phone)\s*[：:]\s*([+\d\s\-]{1,40})",
-                    norm,
-                    re.IGNORECASE,
-                )
-                if pm:
-                    d = _digits(pm.group(1))
-                    # 至少 3 位数字（兼容短号测试；真实场景可在 API 再校验 11 位手机号）
-                    if len(d) >= 3:
-                        ctx.fields["contact_phone"] = d
-                # 无冒号：「电话138…」「手机 138…」「联系电话是138…」
-                if not str(ctx.fields.get("contact_phone") or "").strip():
-                    pm2 = re.search(
-                        r"(?:联系电话|联系方式|手机|手机号|电话|phone)\s*(?:[是为]?\s*)?([1][\d\s\-]{10,18})",
-                        norm,
-                        re.IGNORECASE,
-                    )
-                    if pm2:
-                        d2 = _digits(pm2.group(1))
-                        if len(d2) >= 11 and d2.startswith("1"):
-                            ctx.fields["contact_phone"] = d2[:11]
-                        elif len(d2) >= 3:
-                            ctx.fields["contact_phone"] = d2
-                # 用户只发 11 位号码或带空格分隔的手机号（去掉数字间空格后再匹配）
-                if not str(ctx.fields.get("contact_phone") or "").strip():
-                    norm_m = re.sub(r"(?<=\d)\s+(?=\d)", "", norm)
-                    m3 = re.search(r"(?<!\d)(1[3-9]\d{9})(?!\d)", norm_m)
-                    if m3:
-                        ctx.fields["contact_phone"] = m3.group(1)
-            # 商品名、数量（可选）
-            im = re.search(
-                r"(?:商品名称|商品|item_name|item)\s*[：:]\s*(.+?)(?=(?:\s|^)(?:数量|qty)\s*[：:]|$)",
-                norm,
-                re.IGNORECASE,
-            )
-            if im:
-                ctx.fields["item_name"] = im.group(1).strip()
-            qm = re.search(r"(?:数量|qty)\s*[：:]\s*(\d+)", norm, re.IGNORECASE)
-            if qm:
-                ctx.fields["quantity"] = qm.group(1)
-
-        if ctx.operation in {"cancel", "modify"}:
-            om = re.search(r"(?:订单号|order_id)\s*[：:]\s*([A-Za-z0-9\-]+)", norm, re.IGNORECASE)
-            if om:
-                ctx.fields["order_id"] = om.group(1).strip()
-        if ctx.operation == "cancel":
-            rm = re.search(r"(?:退单原因|原因|reason)\s*[：:]\s*([^。\n]+)", norm, re.IGNORECASE)
-            if rm:
-                ctx.fields["reason"] = rm.group(1).strip()
-        if ctx.operation == "modify":
-            fm = re.search(r"(?:字段|field)\s*[：:]\s*([^\s,，。]+)", norm, re.IGNORECASE)
-            vm = re.search(r"(?:新值|new_value|值)\s*[：:]\s*([^。]+)", norm, re.IGNORECASE)
-            if fm:
-                ctx.fields["field"] = fm.group(1).strip()
-            if vm:
-                ctx.fields["new_value"] = vm.group(1).strip()
-
-    @classmethod
-    def resolve_order_operation(
-        cls,
-        _text: str,
-        hint: str | None,
-        persisted: str | None,
-    ) -> str | None:
-        if hint in ("create", "cancel", "modify"):
-            return hint
-        if persisted in ("create", "cancel", "modify"):
-            return persisted
-        return None
-
-    def _op_zh(self, op: str | None) -> str:
-        mapping = {"create": "下单", "cancel": "退单", "modify": "修改订单"}
-        return mapping.get(op or "", "订单操作")
-
-    def _missing_fields_zh(self, missing: list[str]) -> str:
-        labels = [self.FIELD_LABEL_ZH.get(f, f) for f in missing]
-        return "、".join(labels)
-
-    def _pre_confirm_summary(self, ctx: OrderContext) -> str:
-        """基于已收集字段与清单生成只读摘要（步骤 4 展示用，非 LLM）。"""
-        parts: list[str] = []
-        if ctx.operation == "create" and ctx.items:
-            seg = "；".join(
-                f"{str(p.get('item_name', '')).strip()} x{p.get('quantity', 1)}"
-                for p in ctx.items[:5]
-            )
-            if len(ctx.items) > 5:
-                seg += " …"
-            parts.append(f"拟下单清单：{seg}")
-        for key in self.REQUIRED_FIELDS.get(ctx.operation or "", []):
-            v = ctx.fields.get(key)
-            if v:
-                label = self.FIELD_LABEL_ZH.get(key, key)
-                parts.append(f"{label}：{v}")
-        if ctx.operation == "cancel" and ctx.cancel_order_ids:
-            parts.append(f"待取消笔数：{len(ctx.cancel_order_ids)}")
-        return " ".join(parts) if parts else ""
-
-    # ------- LangChain chain steps（顺序配合 ctx.status；确认步须先于收集以免「确认」被当填表）-------
-    def _reset_ctx_for_operation_change(self, ctx: OrderContext, new_op: str) -> None:
-        if new_op == "cancel":
-            ctx.items = []
-            for k in ("item_name", "quantity", "address", "contact_phone"):
-                ctx.fields.pop(k, None)
-        elif new_op == "create":
-            ctx.cancel_order_ids = []
-        elif new_op == "modify":
-            ctx.items = []
-
-    def _reset_ctx_if_closed_new_intent(
-        self, ctx: OrderContext, operation_hint: str | None
-    ) -> None:
-        """上一轮已 closed 但同会话复用同一 OrderContext 时，清掉旧品项/字段，避免 create→create 不触发换 op 清理。"""
-        if ctx.status != "closed":
-            return
-        if operation_hint not in ("create", "cancel", "modify"):
-            return
-        ctx.items = []
-        ctx.cancel_order_ids = []
-        ctx.fields.clear()
-        ctx.order_link = None
-        ctx.failure_reason = None
-        ctx.operation = None
-        ctx.status = "collecting_info"
+    # -------------------------------------------------------------------------
+    # Runnable 链路（顺序固定：确认须先于收集，避免「确认」被当填表）
+    # -------------------------------------------------------------------------
 
     def _step_route_or_operation(
         self, ctx: OrderContext, text: str, operation_hint: str | None = None
     ) -> dict:
         self._reset_ctx_if_closed_new_intent(ctx, operation_hint)
-        # 步骤 1：订单动作仅来自路由注入的 operation_hint 或 ctx 已有 operation
         if operation_hint in ("create", "cancel", "modify"):
             if ctx.operation != operation_hint:
                 self._reset_ctx_for_operation_change(ctx, operation_hint)
             ctx.operation = operation_hint
         elif ctx.operation is None:
-            ctx.operation = self.resolve_order_operation("", operation_hint, None)
+            ctx.operation = self.resolve_order_operation(text, operation_hint, None)
             if ctx.operation is None:
                 return {
                     "done": True,
@@ -313,6 +79,12 @@ class OrderChain:
                         status=ctx.status,
                         message="请说明是下单、退单还是修改订单信息。",
                         action_required="provide_order_operation",
+                        error=MISSING_ORDER_OPERATION,
+                        debug_trace=order_validation_debug_trace(
+                            phase="route_operation",
+                            codes=[MISSING_ORDER_OPERATION],
+                            operation=None,
+                        ),
                     ),
                     "ctx": ctx,
                     "text": text,
@@ -327,11 +99,11 @@ class OrderChain:
         if ctx.status != "awaiting_pre_confirm":
             return payload
 
-        text_norm = text.strip().lower()
-        yes = text_norm in {"确认", "同意", "yes", "y"} or ("确认" in text and "不确认" not in text)
-        no = text_norm in {"取消", "不同意", "no", "n"} or ("取消" in text or "不同意" in text)
-        if yes or no:
-            return {"done": True, "result": self.apply_pre_confirm(ctx, yes), "ctx": ctx, "text": text}
+        kind = ord_val.classify_pre_confirm_reply(text)
+        if kind == "yes":
+            return {"done": True, "result": self.apply_pre_confirm(ctx, True), "ctx": ctx, "text": text}
+        if kind == "no":
+            return {"done": True, "result": self.apply_pre_confirm(ctx, False), "ctx": ctx, "text": text}
         return {
             "done": True,
             "result": AgentResult(
@@ -339,24 +111,30 @@ class OrderChain:
                 status=ctx.status,
                 message="请直接回复“确认”或“取消”，以决定是否执行订单操作。",
                 action_required="confirm_before_execute",
+                error=ord_val.CONFIRM_INPUT_INVALID,
+                debug_trace=order_validation_debug_trace(
+                    phase="pre_confirm",
+                    codes=[ord_val.CONFIRM_INPUT_INVALID],
+                    operation=ctx.operation,
+                ),
             ),
             "ctx": ctx,
             "text": text,
         }
 
-    def _step_block_if_executed(self, payload: dict) -> dict:
+    def _step_block_after_closed(self, payload: dict) -> dict:
+        """流程已 closed 时短路，避免继续收集。"""
         if payload["done"]:
             return payload
         ctx: OrderContext = payload["ctx"]
-        if ctx.status != "executed_waiting_click":
+        if ctx.status != "closed":
             return payload
         return {
             "done": True,
             "result": AgentResult(
                 route="order",
                 status=ctx.status,
-                message="订单处理已完成，请点击订单链接确认后结束流程。",
-                action_required="click_order_link_confirm",
+                message="订单流程已完成。若需继续，请发起新的订单请求。",
                 order_link=ctx.order_link,
             ),
             "ctx": ctx,
@@ -367,19 +145,26 @@ class OrderChain:
         if payload["done"]:
             return payload
         ctx: OrderContext = payload["ctx"]
-        # 步骤 2–3：合并用户本轮补充的字段，再校验是否齐全
-        self._parse_supplement_fields(ctx, payload["text"])
-        missing = self._missing_fields(ctx)
-        if not missing:
+        ord_val.parse_collect_order_fields(ctx, payload["text"])
+        codes = ord_val.collect_order_validation_codes(ctx)
+        if not codes:
             return payload
         ctx.status = "collecting_info"
+        missing = ord_val.missing_order_field_keys(ctx)
         return {
             "done": True,
             "result": AgentResult(
                 route="order",
                 status="collecting_info",
-                message=f"为继续{self._op_zh(ctx.operation)}，请补充以下信息：{self._missing_fields_zh(missing)}。",
+                message=ord_val.collect_validate_user_message(ctx),
                 action_required="provide_order_fields",
+                error=ord_val.primary_order_validation_code(codes),
+                debug_trace=order_validation_debug_trace(
+                    phase="collect_validate",
+                    codes=codes,
+                    missing_field_keys=missing,
+                    operation=ctx.operation,
+                ),
             ),
             "ctx": ctx,
             "text": payload["text"],
@@ -389,17 +174,327 @@ class OrderChain:
         if payload["done"]:
             return payload["result"]
         ctx: OrderContext = payload["ctx"]
-        # 步骤 4：信息已齐，展示摘要并进入待确认（步骤 5 在 _step_handle_confirm_stage）
         ctx.status = "awaiting_pre_confirm"
-        item_hint = f"（共{len(ctx.items)}个商品）" if ctx.operation == "create" and ctx.items else ""
         summary = self._pre_confirm_summary(ctx)
-        summary_block = f"\n{summary}" if summary else ""
+        summary_block = f"{summary}\n\n" if summary.strip() else ""
         return AgentResult(
             route="order",
             status=ctx.status,
             message=(
-                f"已收集必要信息{item_hint}。{summary_block}\n"
-                f"请确认是否执行{self._op_zh(ctx.operation)}？回复“确认”继续，回复“取消”终止。"
+                "已收集必要信息。\n\n"
+                "【待确认的订单信息】\n"
+                f"{summary_block}"
+                f"请确认是否执行{self._op_zh(ctx.operation)}？回复「确认」继续，回复「取消」终止。"
             ),
             action_required="confirm_before_execute",
         )
+
+    # -------------------------------------------------------------------------
+    # 链路内调用的业务动作（确认 / 调 API / 收尾）
+    # -------------------------------------------------------------------------
+
+    def apply_pre_confirm(self, ctx: OrderContext, confirm: bool) -> AgentResult:
+        if ctx.status != "awaiting_pre_confirm":
+            return AgentResult(
+                route="order",
+                status=ctx.status,
+                message="当前不在执行前确认阶段，请先提供完整订单信息。",
+                action_required="provide_order_fields",
+                error=ord_val.NOT_AWAITING_PRE_CONFIRM,
+                debug_trace=order_validation_debug_trace(
+                    phase="pre_confirm",
+                    codes=[ord_val.NOT_AWAITING_PRE_CONFIRM],
+                    operation=ctx.operation,
+                ),
+            )
+        if not confirm:
+            ctx.status = "closed"
+            return AgentResult(
+                route="order",
+                status="closed",
+                message="已取消本次订单操作。",
+                debug_trace=order_validation_debug_trace(
+                    phase="pre_confirm",
+                    codes=[ORDER_CANCELLED_BY_USER],
+                    operation=ctx.operation,
+                ),
+            )
+        return self.execute(ctx)
+
+    def execute(self, ctx: OrderContext) -> AgentResult:
+        if ctx.operation is None:
+            return AgentResult(
+                route="order",
+                status="failed",
+                message="未识别订单操作类型。",
+                error=MISSING_OPERATION,
+                debug_trace=order_validation_debug_trace(
+                    phase="execute",
+                    codes=[MISSING_OPERATION],
+                    operation=None,
+                ),
+            )
+
+        if ctx.operation == "create":
+            payload = dict(ctx.fields)
+            if ctx.items:
+                payload["items"] = list(ctx.items)
+            result = create_order(payload)
+        elif ctx.operation == "cancel":
+            cancel_reason = (
+                str(ctx.fields.get("remark") or "").strip()
+                or str(ctx.fields.get("reason") or "").strip()
+                or "用户申请取消"
+            )
+            cancel_extra = {
+                "item_name": str(ctx.fields.get("item_name") or "").strip(),
+                "quantity": str(ctx.fields.get("quantity") or "").strip(),
+                "address": str(ctx.fields.get("address") or "").strip(),
+                "contact_phone": str(ctx.fields.get("contact_phone") or "").strip(),
+                "remark": str(ctx.fields.get("remark") or "").strip(),
+            }
+            if ctx.cancel_order_ids:
+                messages: list[str] = []
+                last_link: str | None = None
+                all_ok = True
+                for oid in ctx.cancel_order_ids:
+                    payload = {"order_id": str(oid), "reason": cancel_reason}
+                    payload.update({k: v for k, v in cancel_extra.items() if v})
+                    r = cancel_order(payload)
+                    if r.get("ok"):
+                        messages.append(str(r.get("message", "")))
+                        last_link = r.get("order_link") or last_link
+                    else:
+                        all_ok = False
+                        ctx.failure_reason = r.get("reason", "未知错误")
+                        break
+                if not all_ok:
+                    ctx.status = "failed"
+                    return AgentResult(
+                        route="order",
+                        status=ctx.status,
+                        message=f"{self._op_zh(ctx.operation)}失败：{ctx.failure_reason}",
+                        error=ORDER_API_FAILED,
+                        debug_trace=order_validation_debug_trace(
+                            phase="execute",
+                            codes=[ORDER_API_FAILED],
+                            operation=ctx.operation,
+                            extra={"upstream_reason": ctx.failure_reason},
+                        ),
+                    )
+                ctx.status = "closed"
+                ctx.order_link = last_link
+                return AgentResult(
+                    route="order",
+                    status=ctx.status,
+                    message=f"已处理 {len(ctx.cancel_order_ids)} 笔订单取消申请。"
+                    f" {' '.join(messages[:3])}"
+                    f"{' …' if len(messages) > 3 else ''} 请点击链接查看订单状态。",
+                    order_link=ctx.order_link,
+                )
+            cancel_payload = dict(ctx.fields)
+            if not str(cancel_payload.get("reason") or "").strip():
+                cancel_payload["reason"] = cancel_reason
+            for k, v in cancel_extra.items():
+                if v and not str(cancel_payload.get(k) or "").strip():
+                    cancel_payload[k] = v
+            result = cancel_order(cancel_payload)
+        else:
+            result = modify_order(ctx.fields)
+
+        if not result.get("ok"):
+            ctx.status = "failed"
+            ctx.failure_reason = result.get("reason", "未知错误")
+            return AgentResult(
+                route="order",
+                status=ctx.status,
+                message=f"{self._op_zh(ctx.operation)}失败：{ctx.failure_reason}",
+                error=ORDER_API_FAILED,
+                debug_trace=order_validation_debug_trace(
+                    phase="execute",
+                    codes=[ORDER_API_FAILED],
+                    operation=ctx.operation,
+                    extra={"upstream_reason": ctx.failure_reason},
+                ),
+            )
+
+        ctx.status = "closed"
+        ctx.order_link = result.get("order_link")
+        return AgentResult(
+            route="order",
+            status=ctx.status,
+            message=f"{result.get('message')} 请点击链接查看订单状态。",
+            order_link=ctx.order_link,
+        )
+
+    def finalize(self, ctx: OrderContext, _clicked: bool) -> AgentResult:
+        if ctx.status == "closed":
+            return AgentResult(
+                route="order", status=ctx.status, message="订单流程已完成。"
+            )
+        return AgentResult(
+            route="order",
+            status="closed",
+            message="操作已完成，对应订单链接如下，请点击查看。",
+            order_link=ctx.order_link,
+        )
+
+    # -------------------------------------------------------------------------
+    # 上下文切换（仅供路由步骤）
+    # -------------------------------------------------------------------------
+
+    def _reset_ctx_for_operation_change(self, ctx: OrderContext, new_op: str) -> None:
+        if new_op == "cancel":
+            ctx.items = []
+            for k in ("item_name", "quantity", "address", "contact_phone"):
+                ctx.fields.pop(k, None)
+        elif new_op == "create":
+            ctx.cancel_order_ids = []
+
+    def _reset_ctx_if_closed_new_intent(
+        self, ctx: OrderContext, operation_hint: str | None
+    ) -> None:
+        """closed 后会话复用同一 OrderContext 时清空旧数据，避免连续下单不清理。"""
+        if ctx.status != "closed":
+            return
+        if operation_hint not in ("create", "cancel", "modify"):
+            return
+        ctx.items = []
+        ctx.cancel_order_ids = []
+        ctx.fields.clear()
+        ctx.order_link = None
+        ctx.failure_reason = None
+        ctx.operation = None
+        ctx.status = "collecting_info"
+
+    # -------------------------------------------------------------------------
+    # 文案
+    # -------------------------------------------------------------------------
+
+    def _op_zh(self, op: str | None) -> str:
+        return {"create": "下单", "cancel": "退单", "modify": "修改订单"}.get(op or "", "订单操作")
+
+    def _pre_confirm_summary(self, ctx: OrderContext) -> str:
+        """待确认摘要：表单式排版；多订单时每订单一组。"""
+        op = ctx.operation
+        if op not in ("create", "cancel", "modify"):
+            return ""
+
+        _CREATE = "_create_"
+        _BARE = "_bare_"
+        sections: list[str] = []
+        items = list(ctx.items or [])
+        skip_single_item_fields = bool(items and len(items) >= 1)
+
+        group_map: dict[str, list[dict]] = {}
+        if op == "create":
+            if items:
+                group_map[_CREATE] = list(items)
+        elif items:
+            bare: list[dict] = []
+            for it in items:
+                oid = it.get("order_id")
+                if oid is not None and str(oid).strip():
+                    k = str(oid).strip()
+                    group_map.setdefault(k, []).append(it)
+                else:
+                    bare.append(it)
+            if bare:
+                anchor: str | None = None
+                if ctx.cancel_order_ids and len(ctx.cancel_order_ids) == 1:
+                    anchor = str(ctx.cancel_order_ids[0])
+                elif ord_val.normalize_field_value(ctx.fields.get("order_id")):
+                    anchor = ord_val.normalize_field_value(ctx.fields.get("order_id"))
+                if anchor:
+                    group_map.setdefault(anchor, []).extend(bare)
+                else:
+                    group_map[_BARE] = bare
+
+        def _product_lines(chunk: list[dict]) -> list[str]:
+            lines: list[str] = []
+            for it in chunk[:40]:
+                nm = str(it.get("item_name") or "").strip() or "（未命名商品）"
+                qty = str(it.get("quantity") or "").strip() or "1"
+                pid = it.get("product_id")
+                row = f"  · {nm}  ×{qty}"
+                if pid is not None and str(pid).strip():
+                    row += f"  （商品编号 {pid}）"
+                lines.append(row)
+            if len(chunk) > 40:
+                lines.append(f"  · …（另有 {len(chunk) - 40} 个商品未展示）")
+            return lines
+
+        def _group_sort_keys() -> list[str]:
+            if not group_map:
+                return []
+            if op == "create":
+                return [_CREATE] if _CREATE in group_map else []
+            keys = list(group_map.keys())
+            if op == "cancel" and ctx.cancel_order_ids:
+                out: list[str] = []
+                seen: set[str] = set()
+                for x in ctx.cancel_order_ids:
+                    s = str(x)
+                    if s in group_map and s not in seen:
+                        out.append(s)
+                        seen.add(s)
+                for k in sorted(keys):
+                    if k not in seen and k not in (_BARE,):
+                        out.append(k)
+                        seen.add(k)
+                if _BARE in group_map:
+                    out.append(_BARE)
+                return out
+            fo = ord_val.normalize_field_value(ctx.fields.get("order_id"))
+            if fo and fo in group_map:
+                rest = sorted(k for k in keys if k != fo)
+                return [fo] + rest
+            return sorted(keys)
+
+        for gk in _group_sort_keys():
+            chunk = group_map.get(gk) or []
+            if not chunk:
+                continue
+            if gk == _CREATE:
+                title = "【拟下单 · 商品】"
+            elif gk == _BARE:
+                title = "【商品明细 · 未关联订单号】"
+            else:
+                title = f"【订单 {gk} · 商品】"
+            sections.append(title + "\n" + "\n".join(_product_lines(chunk)))
+
+        if op == "cancel" and ctx.cancel_order_ids and not items:
+            ids_txt = "、".join(str(x) for x in ctx.cancel_order_ids[:40])
+            suf = f"\n（共 {len(ctx.cancel_order_ids)} 笔）" if len(ctx.cancel_order_ids) > 1 else ""
+            sections.append(f"【待取消订单】\n订单号：{ids_txt}{suf}")
+
+        if op == "cancel" and ctx.cancel_order_ids and items:
+            ids_from_items: set[str] = set()
+            for it in items:
+                o = it.get("order_id")
+                if o is not None and str(o).strip():
+                    ids_from_items.add(str(o).strip())
+            orphans = [str(x) for x in ctx.cancel_order_ids if str(x) not in ids_from_items]
+            if orphans and ids_from_items:
+                sections.append(
+                    "【待取消 · 暂无商品明细行的订单】\n订单号：" + "、".join(orphans)
+                )
+
+        skip_dup_order_id = bool(op == "cancel" and ctx.cancel_order_ids)
+        field_lines: list[str] = []
+        for key in display_fields_for(op):
+            if skip_dup_order_id and key == "order_id":
+                continue
+            if skip_single_item_fields and key in {"item_name", "quantity"}:
+                continue
+            val = ord_val.normalize_field_value(ctx.fields.get(key))
+            if not val:
+                continue
+            label = self.FIELD_LABEL_ZH.get(key, key)
+            field_lines.append(f"{label}：{val}")
+
+        if field_lines:
+            block = "\n".join(field_lines)
+            sections.append(("【共用 / 表单信息】\n" + block) if sections else block)
+
+        return "\n\n".join(sections).strip()

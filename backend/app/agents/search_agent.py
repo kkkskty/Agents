@@ -79,6 +79,14 @@ class SearchAgent:
             "3）只生成用户语义的sql，不要生成其他无关的sql。\n"
             "4）比价语义（生成 WHERE 条件时必须一致）：「成交单价」指 order_items.unit_price，「当前标价」指 products.price；"
             "若「当前标价」<「成交单价」，表示现价比下单时更便宜（降价/可捡漏重下单）；若「当前标价」> 「成交单价」，表示现价比下单时更贵（涨价）。\n"
+            "5）凡是订单查询（涉及 orders 或 order_items）必须同时联查 orders 与 order_items，不允许只查其中一张。\n"
+            "6）涉及“降价/比价/重新下单”时，优先使用固定联表骨架："
+            "FROM orders o JOIN order_items oi ON oi.order_id=o.id "
+            "JOIN products p ON p.id=oi.product_id。\n"
+            "7）当用户查询“未付款/待支付订单”（尤其带有“修改/退单/继续处理订单”语义）时，"
+            "必须使用 orders o JOIN order_items oi ON oi.order_id=o.id，"
+            "并在 SELECT 中包含：o.id AS order_id、o.status、o.total_amount、o.created_at、"
+            "oi.product_id、oi.quantity、oi.unit_price（可按语义增减其他列）。\n"
             "技术约束：单条 SELECT，允许 JOIN 多表关联；禁止子查询、多语句与分号；列与表须在目录内。\n"
             f"表结构：\n{self.table_catalog_prompt}\n"
             f"当前会话用户标识 user_id：{user_id}\n"
@@ -88,6 +96,39 @@ class SearchAgent:
         chain_out = self._invoke_sql_chain(question)
         raw = chain_out if isinstance(chain_out, str) else str(chain_out)
         return self._extract_sql_from_chain_output(raw)
+
+    def _extract_order_ids_from_rows(self, rows: list[dict[str, Any]]) -> list[int]:
+        out: list[int] = []
+        seen: set[int] = set()
+        for r in rows:
+            d = dict(r)
+            raw = d.get("order_id")
+            if raw is None:
+                raw = d.get("id")
+            if raw is None:
+                continue
+            s = str(raw).strip()
+            if not s.isdigit():
+                continue
+            oid = int(s)
+            if oid in seen:
+                continue
+            seen.add(oid)
+            out.append(oid)
+        return out
+
+    def _fetch_items_by_order_ids(self, order_ids: list[int], user_id: str) -> list[dict[str, Any]]:
+        if not order_ids:
+            return []
+        ids_sql = ", ".join(str(i) for i in order_ids)
+        sql = (
+            "SELECT oi.order_id, oi.product_id, oi.quantity, oi.unit_price, p.name AS item_name "
+            "FROM order_items oi "
+            "LEFT JOIN products p ON p.id = oi.product_id "
+            f"WHERE oi.order_id IN ({ids_sql})"
+        )
+        rows = execute_user_scoped_sql(sql, user_id)
+        return [dict(r) for r in rows]
 
     def handle(
         self, text: str, user_id: str
@@ -135,12 +176,21 @@ class SearchAgent:
         try:
             rows = execute_user_scoped_sql(sql, user_id)
         except Exception as exc:
+            err = str(exc)
+            if err == "order_query_requires_orders_and_order_items":
+                msg = "订单查询需同时联查 orders 与 order_items，请重试。"
+            elif err.startswith("table_not_allowed:"):
+                msg = "查询引用了未授权表，请换一种问法。"
+            elif err in {"missing_from_table", "only_select_allowed", "multi_statement_not_allowed"}:
+                msg = "生成的 SQL 不符合执行约束，请重试。"
+            else:
+                msg = "查询执行失败，请稍后重试。"
             return (
                 AgentResult(
                     route="query",
                     status="error",
-                    message="查询执行失败，请稍后重试。",
-                    error=str(exc),
+                    message=msg,
+                    error=err,
                     sql_query=sql,
                 ),
                 {},
@@ -201,6 +251,58 @@ class SearchAgent:
             )
         )
         outputs = build_search_task_outputs(row_dicts)
+        # 兜底：若主查询未携带商品明细但拿到了订单号，则补查 order_items+products，
+        # 以保证后续订单修改/退单表单可回填商品名称与数量。
+        if not outputs.get("proposed_order_items"):
+            order_ids = self._extract_order_ids_from_rows(row_dicts)
+            if order_ids:
+                try:
+                    item_rows = self._fetch_items_by_order_ids(order_ids, user_id)
+                except Exception:
+                    item_rows = []
+                if item_rows:
+                    proposed: list[dict[str, Any]] = []
+                    seen: set[tuple[str, str]] = set()
+                    for r in item_rows:
+                        name = str(r.get("item_name") or "").strip()
+                        qty = str(r.get("quantity") or "").strip() or "1"
+                        if not name:
+                            continue
+                        key = (name, qty)
+                        if key in seen:
+                            continue
+                        seen.add(key)
+                        item: dict[str, Any] = {"item_name": name, "quantity": qty}
+                        pid = r.get("product_id")
+                        if pid is not None:
+                            item["product_id"] = pid
+                        proposed.append(item)
+                    if proposed:
+                        outputs["proposed_order_items"] = proposed
+                        by_oid: dict[str, list[dict[str, Any]]] = dict(
+                            outputs.get("order_items_by_order_id") or {}
+                        )
+                        for r in item_rows:
+                            rd = dict(r)
+                            oid_s = str(rd.get("order_id") or "").strip()
+                            if not oid_s:
+                                continue
+                            name = str(rd.get("item_name") or "").strip()
+                            qty = str(rd.get("quantity") or "").strip() or "1"
+                            if not name:
+                                continue
+                            line: dict[str, Any] = {"item_name": name, "quantity": qty}
+                            pid = rd.get("product_id")
+                            if pid is not None:
+                                line["product_id"] = pid
+                            bucket = by_oid.setdefault(oid_s, [])
+                            sig = (line.get("product_id"), line["item_name"], line["quantity"])
+                            if not any(
+                                (x.get("product_id"), x.get("item_name"), str(x.get("quantity"))) == sig
+                                for x in bucket
+                            ):
+                                bucket.append(line)
+                        outputs["order_items_by_order_id"] = by_oid
         task_ctx = runtime.setdefault("task_context", {})
         tctx = task_ctx.setdefault(task_id, {})
         tctx["outputs"] = outputs

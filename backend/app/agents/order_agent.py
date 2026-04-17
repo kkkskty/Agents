@@ -12,7 +12,8 @@ class OrderAgent:
         return self._chain.process_user_text(ctx, text, operation_hint=operation_hint)
 
     def handle_confirm(self, ctx: OrderContext, confirm: bool) -> AgentResult:
-        return self._chain.process_user_text(ctx, "确认" if confirm else "取消")
+        # 必须直接走确认逻辑：process_user_text("取消") 会把「取消」误解析为退单意图（resolve_order_operation）
+        return self._chain.apply_pre_confirm(ctx, confirm)
 
     def finalize(self, ctx: OrderContext, click_confirmed: bool) -> AgentResult:
         return self._chain.finalize(ctx, click_confirmed)

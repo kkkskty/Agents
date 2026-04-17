@@ -6,10 +6,76 @@ OrderOperation = Literal["create", "cancel", "modify"]
 OrderStatus = Literal[
     "collecting_info",
     "awaiting_pre_confirm",
-    "executed_waiting_click",
     "closed",
     "failed",
 ]
+
+
+class DbOrderRow(TypedDict, total=False):
+    """orders 表对应结构。"""
+
+    id: str | int
+    user_id: str | int
+    status: str
+    total_amount: float | int | str
+    created_at: str
+    updated_at: str
+
+
+class DbOrderItemRow(TypedDict, total=False):
+    """order_items 表对应结构。"""
+
+    id: str | int
+    order_id: str | int
+    user_id: str | int
+    product_id: str | int
+    quantity: str | int
+    unit_price: float | int | str
+
+
+class OrderCollectedItem(TypedDict, total=False):
+    """下单/修改收集用条目（前后端表单交互结构）。"""
+
+    order_id: str | int
+    product_id: str | int
+    item_name: str
+    quantity: str
+
+
+class OrderCollectedFields(TypedDict, total=False):
+    """订单收集字段（按前台表单字段定义）。"""
+
+    order_id: str
+    item_name: str
+    quantity: str
+    address: str
+    contact_phone: str
+    remark: str
+    reason: str
+
+
+OrderFormFields = OrderCollectedFields
+
+
+class OrderHeader(TypedDict, total=False):
+    """orders 主表语义（查询/依赖协议用）。"""
+
+    order_id: str | int
+    user_id: str | int
+    status: str
+    total_amount: float | int | str
+    created_at: str
+    updated_at: str
+
+
+class OrderLineItem(TypedDict, total=False):
+    """order_items + products 联查语义（依赖协议 proposed_order_items）。"""
+
+    order_id: str | int
+    product_id: str | int
+    item_name: str
+    quantity: str | int
+    unit_price: float | int | str
 
 
 @dataclass
@@ -18,8 +84,8 @@ class OrderContext:
     user_id: str
     operation: OrderOperation | None = None
     status: OrderStatus = "collecting_info"
-    fields: dict[str, str] = field(default_factory=dict)
-    items: list[dict[str, Any]] = field(default_factory=list)
+    fields: OrderCollectedFields = field(default_factory=dict)
+    items: list[OrderCollectedItem] = field(default_factory=list)
     """依赖查询任务解析出的待取消订单号（库内 orders.id），与单笔 order_id 二选一填充。"""
     cancel_order_ids: list[str] = field(default_factory=list)
     order_link: str | None = None

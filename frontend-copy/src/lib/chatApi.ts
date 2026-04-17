@@ -1,4 +1,4 @@
-import type { ChatMessage, Citation } from '../types/chat'
+import type { ChatMessage, Citation, PendingAction } from '../types/chat'
 
 const base = () =>
   (import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/$/, '') ?? ''
@@ -154,6 +154,7 @@ export async function requestAssistantReply(
   sessionId?: string
   actionRequired?: string
   orderLink?: string
+  pendingActions?: PendingAction[]
 }> {
   const apiBase = base()
   if (apiBase) {
@@ -192,6 +193,7 @@ export async function requestAssistantReply(
       citations?: Citation[]
       action_required?: string
       order_link?: string
+      pending_actions?: PendingAction[]
       error?: string
     }
     const reply = data.reply
@@ -206,6 +208,7 @@ export async function requestAssistantReply(
         sessionId: data.session_id,
         actionRequired: data.action_required,
         orderLink: data.order_link,
+        pendingActions: data.pending_actions,
       }
     }
     if (data.status === 'error' && data.error?.trim()) {
@@ -266,4 +269,113 @@ export async function finalizeOrderFlow(
     throw new Error(t?.trim() || `大模型服务连接失败（${res.status}）`)
   }
   return (await res.json()) as { message: string; status: string }
+}
+
+export async function submitOrderFields(
+  apiBase: string,
+  payload: {
+    sessionId: string
+    userId: string
+    fields: Record<string, string>
+    items?: Array<{ item_name: string; quantity: string }>
+  },
+): Promise<{
+  message: string
+  status: string
+  order_link?: string
+  action_required?: string
+  pending_actions?: PendingAction[]
+  error?: string
+}> {
+  let res: Response
+  try {
+    res = await fetch(`${apiBase}/api/v1/orders/fill-fields`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        session_id: payload.sessionId,
+        user_id: payload.userId,
+        fields: payload.fields,
+        items: payload.items ?? [],
+      }),
+    })
+  } catch (e) {
+    throw mapAssistantRequestError(e)
+  }
+  if (!res.ok) {
+    const t = await res.text()
+    throw new Error(t?.trim() || `订单表单提交失败（${res.status}）`)
+  }
+  return (await res.json()) as {
+    message: string
+    status: string
+    order_link?: string
+    action_required?: string
+    pending_actions?: PendingAction[]
+    error?: string
+  }
+}
+
+/** 订单执行前确认（不走聊天文本，避免「确认/取消」被意图解析干扰） */
+export async function submitOrderConfirm(
+  apiBase: string,
+  payload: { sessionId: string; userId: string; confirm: boolean },
+): Promise<{
+  message: string
+  status: string
+  order_link?: string
+  action_required?: string
+  pending_actions?: PendingAction[]
+  error?: string
+}> {
+  let res: Response
+  try {
+    res = await fetch(`${apiBase}/api/v1/orders/confirm`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        session_id: payload.sessionId,
+        user_id: payload.userId,
+        confirm: payload.confirm,
+      }),
+    })
+  } catch (e) {
+    throw mapAssistantRequestError(e)
+  }
+  if (!res.ok) {
+    const t = await res.text()
+    throw new Error(t?.trim() || `订单确认请求失败（${res.status}）`)
+  }
+  return (await res.json()) as {
+    message: string
+    status: string
+    order_link?: string
+    action_required?: string
+    pending_actions?: PendingAction[]
+    error?: string
+  }
+}
+
+export async function cancelOrderFlow(
+  apiBase: string,
+  payload: { sessionId: string; userId: string },
+): Promise<{ message: string; status: string; error?: string }> {
+  let res: Response
+  try {
+    res = await fetch(`${apiBase}/api/v1/orders/cancel-flow`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        session_id: payload.sessionId,
+        user_id: payload.userId,
+      }),
+    })
+  } catch (e) {
+    throw mapAssistantRequestError(e)
+  }
+  if (!res.ok) {
+    const t = await res.text()
+    throw new Error(t?.trim() || `取消订单流程失败（${res.status}）`)
+  }
+  return (await res.json()) as { message: string; status: string; error?: string }
 }
