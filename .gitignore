@@ -56,3 +56,4 @@ secrets.json
 data/
 temp/
 .cursor/
+backend/.cursor
