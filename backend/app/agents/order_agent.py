@@ -21,10 +21,5 @@ class OrderAgent:
         self, state, ctx: OrderContext, text: str, operation_hint: str | None = None
     ) -> dict:
         result = self.handle_message(ctx, text, operation_hint=operation_hint)
-        workflow = state["order_workflow"]
-        workflow.operation = ctx.operation
-        workflow.step = ctx.status
-        workflow.collected_fields = dict(ctx.fields)
-        workflow.execution_result.order_link = ctx.order_link
-        workflow.execution_result.reason = ctx.failure_reason
-        return {"raw": result}
+        runtime = state["runtime"]
+        return {"runtime": {**runtime, "raw": result}}

@@ -3,7 +3,15 @@ from typing import Any
 from app.schemas.chat import IntentType
 from app.core.llm_provider import LLMRouter
 from app.core.settings import load_settings
-from app.core.state import OrderOperation, SubTask
+from app.core.state import (
+    HandoffTask,
+    OrderOperation,
+    OrderTask,
+    QueryTask,
+    RuleTask,
+    Task,
+    UnknownTask,
+)
 
 
 class IntentRouterAgent:
@@ -11,7 +19,7 @@ class IntentRouterAgent:
         self.settings = load_settings()
         self.llm = LLMRouter(self.settings.intent_agent_llm)
 
-    def analyze(self, text: str) -> tuple[IntentType, list[SubTask]]:
+    def analyze(self, text: str) -> tuple[IntentType, list[Task]]:
         prompt = (
             "你是客服系统任务分析器（Task Planner），你的任务是对用户输入进行路由判定与任务拆解，并严格输出 JSON，不要输出任何额外内容。\n"
             "输出 JSON 格式必须为 \n"
@@ -53,7 +61,7 @@ class IntentRouterAgent:
         route: IntentType = derived_route  # type: ignore[assignment] 意图路由
         return route, tasks
 
-    # def _fallback_tasks_if_json_failed(self, text: str) -> list[SubTask] | None:
+    # def _fallback_tasks_if_json_failed(self, text: str) -> list[Task] | None:
     #     """意图模型返回非合法 JSON 时，对常见句式做固定拆分，避免整请求失败。"""
     #     t = text.strip()
     #     wants_unpaid = any(
@@ -62,13 +70,13 @@ class IntentRouterAgent:
     #     wants_cancel = any(k in t for k in ("取消", "退单", "退掉", "作废", "全部取消", "批量取消"))
     #     if wants_unpaid and wants_cancel:
     #         return [
-    #             SubTask(
+    #             QueryTask(
     #                 id="task_0",
     #                 text="查询当前用户未支付订单",
     #                 intent="query",
     #                 depends_on=[],
     #             ),
-    #             SubTask(
+    #             OrderTask(
     #                 id="task_1",
     #                 text="取消查询到的未支付订单",
     #                 intent="order",
@@ -82,7 +90,7 @@ class IntentRouterAgent:
     #     ) and any(k in t for k in ("钱", "价格", "多少", "单价", "元", "金额"))
     #     if order_and_price:
     #         return [
-    #             SubTask(
+    #             QueryTask(
     #                 id="task_0",
     #                 text="查询当前用户订单及订单明细中的商品与成交单价金额",
     #                 intent="query",
@@ -91,7 +99,7 @@ class IntentRouterAgent:
     #         ]
     #     return None
 
-    def _derive_session_route(self, tasks: list[SubTask]) -> str:
+    def _derive_session_route(self, tasks: list[Task]) -> str:
         """多任务时取第一个非 unknown 的 intent 作为会话级 route。"""
         if not tasks:
             return "unknown"
@@ -141,10 +149,10 @@ class IntentRouterAgent:
     def _canonical_task_id(self, index: int) -> str:
         return f"task_{index}"
 
-    def _validate_and_build_tasks(self, raw_tasks: Any) -> list[SubTask]:
+    def _validate_and_build_tasks(self, raw_tasks: Any) -> list[Task]:
         if not isinstance(raw_tasks, list):
             return []
-        result: list[SubTask] = []
+        result: list[Task] = []
         for item in raw_tasks:
             if not isinstance(item, dict):
                 continue
@@ -173,18 +181,28 @@ class IntentRouterAgent:
             #     ) and not any(k in text for k in ("重新下单", "再下一单", "重新订购", "再买", "下单")):
             #         op_hint = "cancel"
 
-            result.append(
-                SubTask(
-                    id=tid,
-                    text=text,
-                    intent=intent,
-                    depends_on=depends_on,
-                    order_operation_hint=op_hint,
+            if intent == "query":
+                result.append(QueryTask(id=tid, text=text, depends_on=depends_on))
+            elif intent == "rule":
+                result.append(RuleTask(id=tid, text=text, depends_on=depends_on))
+            elif intent == "order":
+                result.append(
+                    OrderTask(
+                        id=tid,
+                        text=text,
+                        depends_on=depends_on,
+                        order_operation_hint=op_hint,
+                    )
                 )
-            )
+            elif intent == "handoff":
+                result.append(HandoffTask(id=tid, text=text, depends_on=depends_on))
+            elif intent == "session_meta":
+                result.append(UnknownTask(id=tid, text=text, depends_on=depends_on))
+            else:
+                result.append(UnknownTask(id=tid, text=text, depends_on=depends_on))
         return result
 
 # ##测试代码
-#     def decompose_sub_tasks(self, text: str) -> list[SubTask]:
+#     def decompose_sub_tasks(self, text: str) -> list[Task]:
 #         _, tasks = self.analyze(text)
 #         return tasks

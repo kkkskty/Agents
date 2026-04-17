@@ -46,10 +46,11 @@ class RAGTool:
         )
 
     def handle_with_state(self, state, text: str) -> dict:
-        idx = state.get("current_task_index", 0)
-        tasks = state.get("sub_tasks", [])
+        runtime = state["runtime"]
+        trace = state["trace"]["rag_trace"]
+        idx = runtime["current_task_index"]
+        tasks = runtime["sub_tasks"]
         task_id = tasks[idx].id if 0 <= idx < len(tasks) else "unknown"
-        state["rag_trace"].retrieval_query = text
         result = self.handle(text)
         hits = result.citations or []
         top_k = len(hits)
@@ -61,9 +62,5 @@ class RAGTool:
             filtered_chunks=list(hits),
             selected_citations=list(hits),
         )
-        state["rag_trace"].records.append(rec)
-        state["rag_trace"].top_k = top_k
-        state["rag_trace"].retrieved_chunks = hits
-        state["rag_trace"].filtered_chunks = hits
-        state["rag_trace"].selected_citations = hits
-        return {"raw": result}
+        trace.records.append(rec)
+        return {"runtime": {**runtime, "raw": result}}

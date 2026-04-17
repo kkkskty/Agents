@@ -182,12 +182,14 @@ class SearchAgent:
         )
 
     def handle_with_state(self, state, text: str) -> dict:
-        user_id = state["conversation"].user_id
+        runtime = state["runtime"]
+        trace_state = state["trace"]
+        user_id = state["session"]["conversation"].user_id
         result, _line_items, _unpaid_ids, row_dicts = self.handle(text, user_id)
-        idx = state.get("current_task_index", 0)
-        tasks = state.get("sub_tasks", [])
+        idx = runtime["current_task_index"]
+        tasks = runtime["sub_tasks"]
         task_id = tasks[idx].id if 0 <= idx < len(tasks) else "unknown"
-        trace = state["sql_query_trace"]
+        trace = trace_state["sql_query_trace"]
         trace.records.append(
             SqlQueryTaskRecord(
                 task_id=task_id,
@@ -199,7 +201,7 @@ class SearchAgent:
             )
         )
         outputs = build_search_task_outputs(row_dicts)
-        task_ctx = state.setdefault("task_context", {})
+        task_ctx = runtime.setdefault("task_context", {})
         tctx = task_ctx.setdefault(task_id, {})
         tctx["outputs"] = outputs
-        return {"raw": result}
+        return {"runtime": {**runtime, "raw": result}}

@@ -33,6 +33,8 @@ class ConversationTurn:
     intent: str | None = None
 
 
+
+###records 会话信息
 @dataclass
 class ConversationState:
     session_id: str
@@ -43,24 +45,8 @@ class ConversationState:
     active_intent: str | None = None
 
 
-@dataclass
-class OrderExecutionResult:
-    ok: bool | None = None
-    message: str | None = None
-    order_link: str | None = None
-    reason: str | None = None
 
-
-@dataclass
-class OrderWorkflowState:
-    operation: OrderOperation | None = None
-    step: OrderStatus = "collecting_info"
-    required_fields: list[str] = field(default_factory=list)
-    collected_fields: dict[str, str] = field(default_factory=dict)
-    pre_confirmed: bool = False
-    execution_result: OrderExecutionResult = field(default_factory=OrderExecutionResult)
-
-
+###records 记录轨迹
 @dataclass
 class RagTaskRecord:
     """单次规则/RAG 子任务的检索轨迹，按 task_id 与 task_results 对齐。"""
@@ -74,13 +60,8 @@ class RagTaskRecord:
 
 @dataclass
 class RagTraceState:
-    """按子任务追加 records；retrieval_* / selected_* 保留为最近一次写入（兼容调试）。"""
+    """按子任务追加 records。"""
     records: list[RagTaskRecord] = field(default_factory=list)
-    retrieval_query: str | None = None
-    top_k: int = 0
-    retrieved_chunks: list[dict[str, Any]] = field(default_factory=list)
-    filtered_chunks: list[dict[str, Any]] = field(default_factory=list)
-    selected_citations: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -101,6 +82,27 @@ class SqlQueryTraceState:
 
 
 @dataclass
+class OrderTaskRecord:
+    """单次订单子任务轨迹。"""
+    task_id: str
+    operation: OrderOperation | None = None
+    source_dep_task_ids: list[str] = field(default_factory=list)
+    loaded_items_count: int = 0
+    status: str | None = None
+    message: str | None = None
+    order_link: str | None = None
+    error: str | None = None
+
+
+@dataclass
+class OrderTraceState:
+    """订单轨迹：按子任务追加。"""
+    records: list[OrderTaskRecord] = field(default_factory=list)
+
+
+
+
+@dataclass
 class ObservabilityState:
     request_id: str = ""
     node_timings: dict[str, float] = field(default_factory=dict)
@@ -118,34 +120,83 @@ class HandoffState:
 
 
 @dataclass
-class SubTask:
+class BaseTask:
     id: str
     text: str
-    intent: str
+    intent: Literal["query", "rule", "order", "handoff", "unknown", "session_meta"]
     status: str = "pending"
     depends_on: list[str] = field(default_factory=list)
+
+
+@dataclass
+class QueryTask(BaseTask):
+    intent: Literal["query"] = "query"
+
+
+@dataclass
+class RuleTask(BaseTask):
+    intent: Literal["rule"] = "rule"
+
+
+@dataclass
+class OrderTask(BaseTask):
+    intent: Literal["order"] = "order"
     order_operation_hint: OrderOperation | None = None
 
-class GraphState(TypedDict, total=False):
-    """LangGraph 单次 invoke 内的共享状态（每轮用户消息会构造新实例并注入会话级对象）。"""
 
-    conversation: ConversationState  # 会话：session_id、user_id、多轮 history、当前/上一轮意图
-    order_workflow: OrderWorkflowState  # 订单流程镜像：与 OrderContext 同步的 step、已收集字段等（便于展示）
-    rag_trace: RagTraceState  # 规则/RAG 子任务检索轨迹（按 task 追加 records）
-    sql_query_trace: SqlQueryTraceState  # SQL 查询子任务轨迹（按 task 追加 records）
-    observability: ObservabilityState  # 可观测：request_id、节点耗时、节点日志、错误列表
-    handoff: HandoffState  # 是否转人工及原因
-    text: str  # 本轮用户原始输入全文
-    session_meta_recall: bool  # 是否命中「会话元问题」短路（仅回顾历史，不跑检索）
-    continuing_order_session: bool  # 是否处于订单续轮（decompose 未走意图拆分、整句当 order）
-    route: str  # dispatch 当前步路由：query|rule|order|handoff|unknown|safe_response|all_done 等
-    sub_tasks: list[SubTask]  # 意图拆分后的子任务列表（含 id、intent、depends_on）
-    task_results: list[dict[str, Any]]  # 各子任务执行结果摘要（与 collect_result 对齐）
-    task_context: dict[str, dict[str, Any]]  # 按 task_id 存放 citations、outputs、SQL 明细等
-    current_task_index: int  # 当前正在执行（或刚完成待汇总）的子任务下标
-    pending_actions: list[dict[str, Any]]  # 待用户侧动作（如订单二次确认）
-    raw: "AgentResult"  # 当前子节点产出的原始 AgentResult（如 query/order 单步结果）
-    result: "AgentResult"  # summarize 节点写入的最终对外结果（整轮回复）
+@dataclass
+class HandoffTask(BaseTask):
+    intent: Literal["handoff"] = "handoff"
+
+
+@dataclass
+class UnknownTask(BaseTask):
+    intent: Literal["unknown"] = "unknown"
+
+
+@dataclass
+class SessionMetaTask(BaseTask):
+    intent: Literal["session_meta"] = "session_meta"
+
+
+Task = QueryTask | RuleTask | OrderTask | HandoffTask | UnknownTask | SessionMetaTask #子任务类型
+
+
+class SessionState(TypedDict):
+    """会话级历史真源。"""
+
+    conversation: ConversationState
+
+
+class RuntimeState(TypedDict, total=False):
+    """单轮编排执行态。"""
+
+    text: str
+    route: str
+    sub_tasks: list[Task]
+    task_results: list[dict[str, Any]]
+    task_context: dict[str, dict[str, Any]]
+    current_task_index: int
+    pending_actions: list[dict[str, Any]]
+    raw: "AgentResult"
+    result: "AgentResult"
+
+
+class TraceState(TypedDict):
+    """调试与可观测态。"""
+
+    rag_trace: RagTraceState
+    sql_query_trace: SqlQueryTraceState
+    order_trace: OrderTraceState
+    observability: ObservabilityState
+
+
+class GraphState(TypedDict):
+    """LangGraph 单次 invoke 内的共享状态（标准化分层结构）。"""
+
+    session: SessionState
+    runtime: RuntimeState
+    trace: TraceState
 
 
 @dataclass

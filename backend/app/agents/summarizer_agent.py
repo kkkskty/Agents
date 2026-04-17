@@ -21,20 +21,22 @@ def _collect_task_citations(state: dict[str, Any], task_id: str) -> list[dict[st
         seen.add(k)
         out.append({"source": source, "chunk_id": chunk_id, "snippet": snippet})
 
-    ctx = (state.get("task_context") or {}).get(task_id)
+    runtime = state["runtime"]
+    trace = state["trace"]
+    ctx = runtime["task_context"].get(task_id)
     if isinstance(ctx, dict):
         for key in ("citations", "sql_citations", "rag_selected_citations"):
             for c in (ctx.get(key) or []):
                 if isinstance(c, dict):
                     _push(c)
 
-    for rec in (getattr(state.get("sql_query_trace"), "records", None) or []):
+    for rec in (trace["sql_query_trace"].records or []):
         if rec.task_id == task_id:
             for c in (rec.citations or []):
                 if isinstance(c, dict):
                     _push(c)
 
-    for rec in (getattr(state.get("rag_trace"), "records", None) or []):
+    for rec in (trace["rag_trace"].records or []):
         if rec.task_id == task_id:
             for c in (rec.selected_citations or []):
                 if isinstance(c, dict):
@@ -195,17 +197,19 @@ class SummarizerAgent:
         return fallback
 
     def summarize_with_state(self, state) -> dict:
-        current_user_text = (state.get("text") or "").strip()
+        runtime = state["runtime"]
+        trace = state["trace"]
+        current_user_text = (runtime["text"] or "").strip()
 
-        tasks = state.get("sub_tasks", [])
-        task_results = state.get("task_results", [])
+        tasks = runtime["sub_tasks"]
+        task_results = runtime["task_results"]
         result_map = {str(t.get("task_id", "")): t for t in task_results}
         merged_citations: list[dict[str, Any]] = []
         lines: list[str] = []
 
-        if not tasks and state.get("raw") is not None:
-            raw = state["raw"]
-            tasks = [type("TmpTask", (), {"id": "task_0", "text": state.get("text", ""), "intent": raw.route})()]
+        if not tasks and "raw" in runtime:
+            raw = runtime["raw"]
+            tasks = [type("TmpTask", (), {"id": "task_0", "text": runtime["text"], "intent": raw.route})()]
             result_map["task_0"] = {
                 "task_id": "task_0",
                 "intent": raw.route,
@@ -221,7 +225,7 @@ class SummarizerAgent:
             tr = result_map.get(tid, {})
             status = str(tr.get("status", "unknown"))
             msg = str(tr.get("message", "") or "")
-            tctx = (state.get("task_context") or {}).get(tid) or {}
+            tctx = runtime["task_context"].get(tid) or {}
             outputs = tctx.get("outputs") if isinstance(tctx, dict) else {}
             citations = _collect_task_citations(state, tid)
             merged_citations.extend(citations)
@@ -263,15 +267,13 @@ class SummarizerAgent:
                 link_txt = f"，订单链接：{order_link}" if order_link else ""
                 ans = f"当前订单处理状态：{status}。{msg}{link_txt}"
             elif intent == "handoff":
-                hs = state.get("handoff").status if state.get("handoff") else "inactive"
+                hs = str(tr.get("handoff_status") or "active")
                 ans = f"当前人工处理状态：{hs}。{msg}"
             else:
                 ans = (msg or "").strip() or "未识别意图，请说明您是要查询信息、咨询规则，还是处理订单（下单/退单/修改）。"
 
-            cont = bool(state.get("continuing_order_session"))
             use_plain = (
-                cont
-                or intent == "session_meta"
+                intent == "session_meta"
                 or (len(tasks) == 1 and intent == "query")
                 or (len(tasks) == 1 and intent == "rule")
                 or (
@@ -314,10 +316,17 @@ class SummarizerAgent:
             message="\n".join(lines),
             citations=merged_citations or None,
         )
-        obs = state["observability"]
+        obs = trace["observability"]
         final_result.request_id = obs.request_id
-        final_result.workflow_step = state["order_workflow"].step
-        final_result.handoff_status = state["handoff"].status
+        order_step = None
+        for rec in reversed(trace["order_trace"].records):
+            if rec.status:
+                order_step = rec.status
+                break
+        if order_step is None and len(tasks) == 1 and tasks[0].intent == "order":
+            order_step = final_status
+        final_result.workflow_step = order_step
+        final_result.handoff_status = "active" if any(t.intent == "handoff" for t in tasks) else "inactive"
         final_result.debug_trace = {
             "node_timings": obs.node_timings,
             "node_logs": obs.node_logs,
@@ -327,5 +336,5 @@ class SummarizerAgent:
         total = len(tasks)
         final_result.sub_task_count = total
         final_result.sub_task_progress = f"{done}/{total}" if total else None
-        final_result.pending_actions = state.get("pending_actions", [])
-        return {"result": final_result}
+        final_result.pending_actions = runtime["pending_actions"]
+        return {"runtime": {**runtime, "result": final_result}}

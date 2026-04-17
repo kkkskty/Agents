@@ -41,13 +41,14 @@ flowchart TD
 
 处理：
 1. 编排器确保 `session_id` 存在（无则创建）。
-2. 从会话存储装载 `GraphState` 关键子状态：
-   - `conversation`
-   - `order_workflow`
-   - `rag_trace`
-   - `observability`
-   - `handoff`
+2. 从会话存储装载 `GraphState.session`（`conversation`），并初始化本轮：
+   - `runtime`（文本、子任务、路由、结果，含 `raw/result`）
+   - `trace`（`rag_trace/sql_query_trace/order_trace/observability`）
 3. 进入图执行。
+
+任务模型说明：
+- `runtime.sub_tasks` 使用多态任务联合 `Task`。
+- 订单专属信息（如 `order_operation_hint`）仅存在于 `OrderTask`。
 
 输出：
 - 标准应答字段（`route/status/reply/...`）
