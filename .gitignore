@@ -1,0 +1,56 @@
+# =========================
+# Logs
+# =========================
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# =========================
+# Node / Frontend
+# =========================
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# =========================
+# Python
+# =========================
+__pycache__/
+*.pyc
+.pytest_cache/
+venv/
+env/
+.venv/
+
+# =========================
+# IDE / OS
+# =========================
+.vscode/*
+!.vscode/extensions.json
+.idea/
+*.iml
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# =========================
+# Secrets / Local configs
+# =========================
+config_local.py
+secrets.json
+.env
+需求文档.md
+
+# =========================
+# Temp / Data
+# =========================
+data/
+temp/
