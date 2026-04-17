@@ -49,8 +49,10 @@ secrets.json
 .env
 需求文档.md
 
+
 # =========================
 # Temp / Data
 # =========================
 data/
 temp/
+.cursor/
