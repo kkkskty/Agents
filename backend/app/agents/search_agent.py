@@ -1,4 +1,3 @@
-import re
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from typing import Any
 from urllib.parse import quote_plus
@@ -75,7 +74,9 @@ class SearchAgent:
             "你是 Text-to-SQL 助手。根据用户问题生成**一条** MySQL SELECT 语句。\n"
             "业务约束（必须遵守）：\n"
             "1）只能查询下面「表结构」中出现的表，禁止引用未提供的表；\n"
-            "2）不得查询、暴露或筛选到其他用户的数据；仅与当前会话用户相关（当前用户标识见文末）。\n"
+            "2）不得查询、暴露或筛选到其他用户的数据。"
+            "users/orders/order_items/refunds 须按 user_id 限定；products 为全站商品目录（无 user_id 列），"
+            "仅查商品名/价/库存时只使用 products，禁止对 products 写 user_id 条件或与 orders 无关的硬联表。\n"
             "3）只生成用户语义的sql，不要生成其他无关的sql。\n"
             "4）比价语义（生成 WHERE 条件时必须一致）：「成交单价」指 order_items.unit_price，「当前标价」指 products.price；"
             "若「当前标价」<「成交单价」，表示现价比下单时更便宜（降价/可捡漏重下单）；若「当前标价」> 「成交单价」，表示现价比下单时更贵（涨价）。\n"
@@ -87,6 +88,17 @@ class SearchAgent:
             "必须使用 orders o JOIN order_items oi ON oi.order_id=o.id，"
             "并在 SELECT 中包含：o.id AS order_id、o.status、o.total_amount、o.created_at、"
             "oi.product_id、oi.quantity、oi.unit_price（可按语义增减其他列）。\n"
+            "8）「仅商品价格 / 库存 / 搜商品名」且未提及订单、订单号、「我的订单」时：仅用单表 products；"
+            "示例：SELECT id, name, price, stock FROM products WHERE name LIKE '%关键词%'；"
+            "关键词取自用户问题（如小米充电器）；不要 JOIN orders/order_items；不要用子查询；"
+            "products 表无 user_id 列，禁止出现 products.user_id。\n"
+            "9）凡在 WHERE/JOIN 中写 users.id、orders.user_id、order_items.user_id 等与用户相关的等值条件时，"
+            "必须与下方「当前会话用户标识」完全一致：若标识为数字请用同一数字（如 1）；若标识含字母请用带引号的字符串（如 'demo_user'）。"
+            "禁止写成无引号的裸词（如 user_id = demo_user），否则会被数据库当成列名而报错。\n"
+            "10）禁止使用窗口函数（含 SUM(...)、AVG(...) 等与 OVER (...) 连用，以及 ROW_NUMBER() OVER 等）；"
+            "MySQL 易报 3593。筛选「订单里已降价商品」请用 JOIN products 后直接比较列："
+            "WHERE p.price < oi.unit_price（当前标价低于成交单价即相对下单时更便宜）；"
+            "不要用 SUM(...) OVER、不要在 WHERE 里写窗口表达式。\n"
             "技术约束：单条 SELECT，允许 JOIN 多表关联；禁止子查询、多语句与分号；列与表须在目录内。\n"
             f"表结构：\n{self.table_catalog_prompt}\n"
             f"当前会话用户标识 user_id：{user_id}\n"
@@ -97,55 +109,23 @@ class SearchAgent:
         raw = chain_out if isinstance(chain_out, str) else str(chain_out)
         return self._extract_sql_from_chain_output(raw)
 
-    def _extract_order_ids_from_rows(self, rows: list[dict[str, Any]]) -> list[int]:
-        out: list[int] = []
-        seen: set[int] = set()
-        for r in rows:
-            d = dict(r)
-            raw = d.get("order_id")
-            if raw is None:
-                raw = d.get("id")
-            if raw is None:
-                continue
-            s = str(raw).strip()
-            if not s.isdigit():
-                continue
-            oid = int(s)
-            if oid in seen:
-                continue
-            seen.add(oid)
-            out.append(oid)
-        return out
-
-    def _fetch_items_by_order_ids(self, order_ids: list[int], user_id: str) -> list[dict[str, Any]]:
-        if not order_ids:
-            return []
-        ids_sql = ", ".join(str(i) for i in order_ids)
-        sql = (
-            "SELECT oi.order_id, oi.product_id, oi.quantity, oi.unit_price, p.name AS item_name "
-            "FROM order_items oi "
-            "LEFT JOIN products p ON p.id = oi.product_id "
-            f"WHERE oi.order_id IN ({ids_sql})"
-        )
-        rows = execute_user_scoped_sql(sql, user_id)
-        return [dict(r) for r in rows]
-
     def handle(
         self, text: str, user_id: str
     ) -> tuple[AgentResult, dict[str, list[dict[str, Any]]], list[str], list[dict[str, Any]]]:
         try:
             sql = self._generate_sql(text, user_id)
         except Exception as exc:
-            err = str(exc)
-            if err == "sql_chain_unavailable":
-                msg = "大模型未配置或不可用，无法生成查询。"
+            err = repr(exc)
+            simple = str(exc)
+            if simple == "sql_chain_unavailable":
+                msg = "sql_chain_unavailable：大模型未配置或不可用。"
                 code = "sql_chain_unavailable"
             elif isinstance(exc, TimeoutError) or "timeout" in err.lower():
-                msg = "大模型生成 SQL 超时，请稍后重试或调大环境变量 LLM_INVOKE_TIMEOUT_S。"
-                code = err
+                msg = f"生成 SQL 超时：{err}"
+                code = simple or err
             else:
-                msg = "大模型生成 SQL 失败，请稍后重试或换一种问法。"
-                code = err
+                msg = f"生成 SQL 失败：{err}"
+                code = simple or err
             return (
                 AgentResult(
                     route="query",
@@ -164,7 +144,7 @@ class SearchAgent:
                 AgentResult(
                     route="query",
                     status="error",
-                    message="大模型生成的 SQL 不可用，无法执行。",
+                    message=f"生成的 SQL 不可用（校验未通过）：{sql!r}",
                     error="invalid_generated_sql",
                     sql_query=sql,
                 ),
@@ -176,21 +156,30 @@ class SearchAgent:
         try:
             rows = execute_user_scoped_sql(sql, user_id)
         except Exception as exc:
-            err = str(exc)
-            if err == "order_query_requires_orders_and_order_items":
-                msg = "订单查询需同时联查 orders 与 order_items，请重试。"
-            elif err.startswith("table_not_allowed:"):
-                msg = "查询引用了未授权表，请换一种问法。"
-            elif err in {"missing_from_table", "only_select_allowed", "multi_statement_not_allowed"}:
-                msg = "生成的 SQL 不符合执行约束，请重试。"
+            err = repr(exc)
+            simple = str(exc)
+            if simple == "order_query_requires_orders_and_order_items":
+                msg = f"订单查询需同时联查 orders 与 order_items。{err}"
+            elif simple.startswith("table_not_allowed:"):
+                msg = f"引用了未授权表。{err}"
+            elif simple.startswith("user_scope_literal_mismatch:"):
+                msg = f"用户范围与当前登录不一致。{err}"
+            elif simple == "window_function_not_allowed":
+                msg = (
+                    "生成的 SQL 使用了窗口函数（如 SUM OVER），当前库不支持该写法。"
+                    "比价/降价请使用：FROM orders o JOIN order_items oi … JOIN products p … "
+                    "且 WHERE p.price < oi.unit_price（并限定用户订单）。"
+                )
+            elif simple in {"missing_from_table", "only_select_allowed", "multi_statement_not_allowed"}:
+                msg = f"SQL 不满足执行约束。{err}"
             else:
-                msg = "查询执行失败，请稍后重试。"
+                msg = f"SQL 执行失败：{err}"
             return (
                 AgentResult(
                     route="query",
                     status="error",
                     message=msg,
-                    error=err,
+                    error=simple or err,
                     sql_query=sql,
                 ),
                 {},
@@ -204,7 +193,7 @@ class SearchAgent:
                 AgentResult(
                     route="query",
                     status="no_result",
-                    message="未查询到相关数据。",
+                    message=f"查询无数据（SQL 已执行）：{sql!r}",
                     error="search_no_result",
                     sql_query=sql,
                 ),
@@ -251,58 +240,6 @@ class SearchAgent:
             )
         )
         outputs = build_search_task_outputs(row_dicts)
-        # 兜底：若主查询未携带商品明细但拿到了订单号，则补查 order_items+products，
-        # 以保证后续订单修改/退单表单可回填商品名称与数量。
-        if not outputs.get("proposed_order_items"):
-            order_ids = self._extract_order_ids_from_rows(row_dicts)
-            if order_ids:
-                try:
-                    item_rows = self._fetch_items_by_order_ids(order_ids, user_id)
-                except Exception:
-                    item_rows = []
-                if item_rows:
-                    proposed: list[dict[str, Any]] = []
-                    seen: set[tuple[str, str]] = set()
-                    for r in item_rows:
-                        name = str(r.get("item_name") or "").strip()
-                        qty = str(r.get("quantity") or "").strip() or "1"
-                        if not name:
-                            continue
-                        key = (name, qty)
-                        if key in seen:
-                            continue
-                        seen.add(key)
-                        item: dict[str, Any] = {"item_name": name, "quantity": qty}
-                        pid = r.get("product_id")
-                        if pid is not None:
-                            item["product_id"] = pid
-                        proposed.append(item)
-                    if proposed:
-                        outputs["proposed_order_items"] = proposed
-                        by_oid: dict[str, list[dict[str, Any]]] = dict(
-                            outputs.get("order_items_by_order_id") or {}
-                        )
-                        for r in item_rows:
-                            rd = dict(r)
-                            oid_s = str(rd.get("order_id") or "").strip()
-                            if not oid_s:
-                                continue
-                            name = str(rd.get("item_name") or "").strip()
-                            qty = str(rd.get("quantity") or "").strip() or "1"
-                            if not name:
-                                continue
-                            line: dict[str, Any] = {"item_name": name, "quantity": qty}
-                            pid = rd.get("product_id")
-                            if pid is not None:
-                                line["product_id"] = pid
-                            bucket = by_oid.setdefault(oid_s, [])
-                            sig = (line.get("product_id"), line["item_name"], line["quantity"])
-                            if not any(
-                                (x.get("product_id"), x.get("item_name"), str(x.get("quantity"))) == sig
-                                for x in bucket
-                            ):
-                                bucket.append(line)
-                        outputs["order_items_by_order_id"] = by_oid
         task_ctx = runtime.setdefault("task_context", {})
         tctx = task_ctx.setdefault(task_id, {})
         tctx["outputs"] = outputs

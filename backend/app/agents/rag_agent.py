@@ -12,14 +12,19 @@ class RAGTool:
             hits = query_chroma(text)  #RAG查询
         except Exception as exc:
             detail = str(exc).strip()
+            low = detail.lower()
             if len(detail) > 400:
                 detail = detail[:400] + "…"
+            hint = ""
+            if "403" in detail or "insufficient" in low or "quota" in low or "balance" in low:
+                hint = "（Embedding API 额度/余额不足或为 403：请充值或更换 RAG_EMBEDDING_API_KEY / 本地模型。）"
             return AgentResult(
                 route="rule",
                 status="error",
                 message=(
                     "RAG 检索失败。"
                     + (f" 原因：{detail}" if detail else " 请检查网络、API Key、CHROMA_PATH 与集合配置。")
+                    + hint
                 ),
                 error=str(exc),
             )

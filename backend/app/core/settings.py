@@ -64,6 +64,12 @@ class AppSettings:
     mysql_password: str
     mysql_database: str
     sql_max_rows: int
+    router_context_rounds: int
+    router_context_max_chars: int
+    session_memory_rounds_k: int
+    memory_summary_max_chars: int
+    summarizer_context_rounds: int
+    summarizer_context_max_chars: int
 
 
 def _as_bool(name: str, default: bool) -> bool:
@@ -193,4 +199,10 @@ def load_settings() -> AppSettings:
         mysql_password=os.getenv("MYSQL_PASSWORD", "123456"),
         mysql_database=os.getenv("MYSQL_DATABASE", "shop"),
         sql_max_rows=_as_int("SQL_MAX_ROWS", 50),
+        router_context_rounds=max(1, _as_int("ROUTER_CONTEXT_ROUNDS", 8)),
+        router_context_max_chars=max(1000, _as_int("ROUTER_CONTEXT_MAX_CHARS", 8000)),
+        session_memory_rounds_k=max(1, _as_int("SESSION_MEMORY_ROUNDS_K", _as_int("MAX_HISTORY_TURNS", 20))),
+        memory_summary_max_chars=max(500, _as_int("MEMORY_SUMMARY_MAX_CHARS", 4000)),
+        summarizer_context_rounds=max(1, _as_int("SUMMARIZER_CONTEXT_ROUNDS", 2)),
+        summarizer_context_max_chars=max(800, _as_int("SUMMARIZER_CONTEXT_MAX_CHARS", 4000)),
     )

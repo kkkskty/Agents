@@ -13,6 +13,7 @@ from app.core.state import (
     SessionState,
     SqlQueryTraceState,
     TraceState,
+    StepArtifact,
 )
 
 
@@ -21,6 +22,21 @@ class SessionStore:
         self._orders: dict[str, OrderContext] = {}
         self._handoffs: dict[str, HandoffState] = {}
         self._graph_states: dict[str, GraphState] = {}
+        #: session_id -> global step_id -> 最近一步产物（跨轮可查）
+        self._step_artifacts: dict[str, dict[str, StepArtifact]] = {}
+
+    def put_step_artifact(self, session_id: str, artifact: StepArtifact) -> None:
+        self._step_artifacts.setdefault(session_id, {})[artifact.step_id] = artifact
+
+    def get_step_artifact(self, session_id: str, step_id: str) -> StepArtifact | None:
+        return self._step_artifacts.get(session_id, {}).get(step_id)
+
+    def list_step_ids(self, session_id: str) -> list[str]:
+        return sorted(self._step_artifacts.get(session_id, {}).keys())
+
+    def iter_recent_step_artifacts(self, session_id: str, limit: int = 15) -> list[StepArtifact]:
+        arts = list(self._step_artifacts.get(session_id, {}).values())
+        return arts[-limit:] if limit > 0 else arts
 
     def ensure_session(self, session_id: str | None) -> str:
         return session_id or str(uuid4())
@@ -48,6 +64,10 @@ class SessionStore:
 
     def get_handoff(self, session_id: str) -> HandoffState | None:
         return self._handoffs.get(session_id)
+
+    def try_get_graph_state(self, session_id: str) -> GraphState | None:
+        """不创建会话时用于调试/只读预览。"""
+        return self._graph_states.get(session_id)
 
     def get_or_create_graph_state(self, session_id: str, user_id: str) -> GraphState:
         state = self._graph_states.get(session_id)
@@ -87,6 +107,11 @@ class SessionStore:
         return state
 
     def save_graph_state(self, session_id: str, state: GraphState) -> None:
+        from app.core.session_memory import trim_history_if_needed
+        from app.core.settings import load_settings
+
+        conv = state["session"]["conversation"]
+        trim_history_if_needed(conv, load_settings())
         self._graph_states[session_id] = state
 
     def append_history(self, session_id: str, role: str, content: str, intent: str | None = None) -> None:

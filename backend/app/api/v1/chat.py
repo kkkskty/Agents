@@ -16,16 +16,19 @@ def post_chat_message(req: ChatMessageRequest) -> ChatMessageResponse:
             user_id=req.user_id, text=req.text, session_id=req.session_id
         )
     except Exception as exc:
+        detail = repr(exc)
         return ChatMessageResponse(
             session_id=sid,
+            turn_id=None,
             route="unknown",
-            reply="当前请求处理超时或失败，请稍后重试。",
+            reply=f"请求失败：{detail}",
             status="error",
             error=str(exc),
         )
     return ChatMessageResponse(
         session_id=sid,
-        route=result.route,  # type: ignore[arg-type]
+        turn_id=result.turn_id,
+        route=result.route,
         reply=result.message,
         status=result.status,
         action_required=result.action_required,

@@ -3,7 +3,7 @@ from typing import Literal
 from pydantic import BaseModel, Field
 
 
-IntentType = Literal["query", "rule", "order", "handoff", "unknown"]
+IntentType = Literal["query", "rule", "order", "handoff", "unknown", "session_meta"]
 
 
 class ChatMessageRequest(BaseModel):
@@ -21,6 +21,7 @@ class Citation(BaseModel):
 
 class ChatMessageResponse(BaseModel):
     session_id: str
+    turn_id: str | None = Field(default=None, description="本轮用户请求的 turn_id")
     route: IntentType
     reply: str
     status: str

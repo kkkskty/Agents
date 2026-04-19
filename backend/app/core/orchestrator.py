@@ -1,3 +1,4 @@
+import json
 from time import perf_counter
 from typing import Any
 from uuid import uuid4
@@ -24,9 +25,13 @@ from app.agents.order_agent import OrderAgent
 from app.agents.rag_agent import RAGTool
 from app.agents.search_agent import SearchAgent
 from app.agents.summarizer_agent import SummarizerAgent
+from app.agents.task_injectors import TaskInjectors
+from app.core.step_dag import global_step_id
+from app.core.conversation_context import build_context_for_router
 from app.core.session_store import SessionStore
 from app.core.settings import load_settings
 from app.tools.sql_query_tool import execute_user_scoped_sql
+from app.core.session_meta_reply import format_session_meta_reply
 from app.core.state import (
     AgentResult,
     GraphState,
@@ -38,8 +43,11 @@ from app.core.state import (
     QueryTask,
     RagTraceState,
     RuleTask,
+    SessionMetaTask,
     SqlQueryTraceState,
     OrderTraceState,
+    StepArtifact,
+    StepRef,
     Task,
     UnknownTask,
 )
@@ -54,6 +62,7 @@ class MultiAgentOrchestrator:
         self.rag_tool = RAGTool()
         self.order_agent = OrderAgent()
         self.summarizer = SummarizerAgent()
+        self.injectors = TaskInjectors()
         self.graph = self._build_graph()
 
     def _build_graph(self):
@@ -66,6 +75,7 @@ class MultiAgentOrchestrator:
         graph.add_node("order_agent", self._order_node)
         graph.add_node("handoff_node", self._handoff_node)
         graph.add_node("unknown_agent", self._unknown_node)
+        graph.add_node("session_meta_agent", self._session_meta_node)
         graph.add_node("safe_response", self._safe_response_node)
         graph.add_node("collect_result", self._collect_result_node)
         graph.add_node("summarize", self._summarize_node)
@@ -86,6 +96,7 @@ class MultiAgentOrchestrator:
                 "rule": "rule_agent",
                 "order": "order_agent",
                 "handoff": "handoff_node",
+                "session_meta": "session_meta_agent",
                 "unknown": "unknown_agent",
                 "safe_response": "safe_response",
                 "all_done": "summarize",
@@ -95,6 +106,7 @@ class MultiAgentOrchestrator:
         graph.add_edge("rule_agent", "collect_result")
         graph.add_edge("order_agent", "collect_result")
         graph.add_edge("handoff_node", "collect_result")
+        graph.add_edge("session_meta_agent", "collect_result")
         graph.add_edge("unknown_agent", "collect_result")
         graph.add_edge("safe_response", "collect_result")
         graph.add_edge("collect_result", "dispatch")
@@ -106,12 +118,14 @@ class MultiAgentOrchestrator:
         sid = self.session_store.ensure_session(session_id)
         gs = self.session_store.get_or_create_graph_state(sid, user_id)
         conv = gs["session"]["conversation"]
+        turn_id = str(uuid4())
         state: GraphState = {
             "session": {
                 "conversation": conv,
             },
             "runtime": {
                 "text": text,
+                "turn_id": turn_id,
                 "route": "unknown",
                 "sub_tasks": [],
                 "task_results": [],
@@ -306,13 +320,17 @@ class MultiAgentOrchestrator:
             conv = state["session"]["conversation"]
             conv.last_intent = conv.active_intent
             conv.active_intent = "order"
+            rt = state["runtime"]
+            otid = rt.get("turn_id") or str(uuid4())
+            oid = global_step_id(otid, "task_0")
             return {
                 "runtime": {
-                    "text": state["runtime"]["text"],
+                    **rt,
+                    "turn_id": otid,
                     "route": "order",
                     "sub_tasks": [
                         OrderTask(
-                            id="task_1",
+                            id=oid,
                             text=state["runtime"]["text"],
                             order_operation_hint=active_order.operation,
                         )
@@ -329,10 +347,24 @@ class MultiAgentOrchestrator:
                     "observability": state["trace"]["observability"],
                 },
             }
-        # 无活跃订单时按常规意图拆解
-        route, tasks = self.intent_router.analyze(state["runtime"]["text"])
+        # 无活跃订单时按常规意图拆解（含会话摘要与最近轮次）
+        conv_for_route = state["session"]["conversation"]
+        router_block = build_context_for_router(
+            conv_for_route,
+            (state["runtime"]["text"] or "").strip(),
+            self.settings,
+        )
+        rt = state["runtime"]
+        cur_turn = rt.get("turn_id") or str(uuid4())
+        route, tasks = self.intent_router.analyze(
+            router_block,
+            turn_id=cur_turn,
+            session_id=conv_for_route.session_id,
+            session_store=self.session_store,
+        )
         if not tasks:
-            tasks = [UnknownTask(id="task_1", text=state["runtime"]["text"])]
+            uid = global_step_id(cur_turn, "task_0")
+            tasks = [UnknownTask(id=uid, text=state["runtime"]["text"])]
         tasks = [self._to_task(t) for t in tasks]
         tasks = tasks[: max(1, self.settings.max_sub_tasks)]
         conv = state["session"]["conversation"]
@@ -340,6 +372,8 @@ class MultiAgentOrchestrator:
         conv.active_intent = route
         return {
             "runtime": {
+                **rt,
+                "turn_id": cur_turn,
                 "text": state["runtime"]["text"],
                 "route": route,
                 "sub_tasks": tasks,
@@ -356,15 +390,27 @@ class MultiAgentOrchestrator:
             },
         }
     
+    @staticmethod
+    def _coerce_depends(raw: Any) -> list[StepRef]:
+        out: list[StepRef] = []
+        if not raw:
+            return out
+        for x in raw:
+            if isinstance(x, StepRef):
+                out.append(x)
+            elif isinstance(x, dict) and x.get("turn_id") is not None and x.get("step_id") is not None:
+                out.append(StepRef(turn_id=str(x["turn_id"]), step_id=str(x["step_id"])))
+        return out
+
 #将意图拆解结果转换为子任务
     def _to_task(self, task: Any) -> Task:
-        if isinstance(task, (QueryTask, RuleTask, OrderTask, HandoffTask, UnknownTask)):
+        if isinstance(task, (QueryTask, RuleTask, OrderTask, HandoffTask, UnknownTask, SessionMetaTask)):
             return task
         intent = getattr(task, "intent", "unknown")
         task_id = getattr(task, "id", "task_0")
         text = getattr(task, "text", "")
         status = getattr(task, "status", "pending")
-        depends_on = list(getattr(task, "depends_on", []) or [])
+        depends_on = self._coerce_depends(getattr(task, "depends_on", []) or [])
         if intent == "query":
             return QueryTask(id=task_id, text=text, status=status, depends_on=depends_on)
         if intent == "rule":
@@ -379,27 +425,36 @@ class MultiAgentOrchestrator:
             )
         if intent == "handoff":
             return HandoffTask(id=task_id, text=text, status=status, depends_on=depends_on)
+        if intent == "session_meta":
+            return SessionMetaTask(id=task_id, text=text, status=status, depends_on=depends_on)
         return UnknownTask(id=task_id, text=text, status=status, depends_on=depends_on)
 
 #判断子任务依赖是否满足 没满足直接失败
-    def _deps_satisfied(self, task: Task, task_map: dict[str, Task]) -> bool:
-        deps = task.depends_on or []
-        if not deps:
-            return True
-        for dep_id in deps:
-            dep = task_map.get(dep_id)
-            if dep is None:
-                continue
-            if dep.status not in {"done", "failed"}:
-                return False
+    def _deps_satisfied(
+        self, task: Task, task_map: dict[str, Task], session_id: str, current_turn_id: str
+    ) -> bool:
+        for ref in task.depends_on or []:
+            if ref.turn_id == current_turn_id:
+                dep = task_map.get(ref.step_id)
+                if dep is None:
+                    return False
+                if dep.status not in {"done", "failed"}:
+                    return False
+            else:
+                art = self.session_store.get_step_artifact(session_id, ref.step_id)
+                if art is None:
+                    return False
         return True
+
 #获取下一个可执行子任务的索引
-    def _next_ready_task_index(self, tasks: list[Task]) -> int | None:
+    def _next_ready_task_index(
+        self, tasks: list[Task], session_id: str, current_turn_id: str
+    ) -> int | None:
         task_map = {t.id: t for t in tasks}
         for i, t in enumerate(tasks):
             if t.status in {"done", "failed"}:
                 continue
-            if self._deps_satisfied(t, task_map):
+            if self._deps_satisfied(t, task_map, session_id, current_turn_id):
                 return i
         return None
 #查询缺失字段 
@@ -430,8 +485,10 @@ class MultiAgentOrchestrator:
                     if ids_for_items:
                         try:
                             fetched_items = self._fetch_order_items_by_order_ids(ids_for_items, ctx.user_id)
-                        except Exception:
-                            fetched_items = []
+                        except Exception as exc:
+                            raise RuntimeError(
+                                f"prefetch_order_items_failed: {exc!r}"
+                            ) from exc
                         if fetched_items:
                             ctx.items = fetched_items
                 if ctx.operation in {"cancel", "modify"} and ctx.items:
@@ -516,7 +573,7 @@ class MultiAgentOrchestrator:
             "error": raw.error,
             "message": raw.message,
             "sql_query": raw.sql_query,
-            "depends_on": list(task.depends_on or []),
+            "depends_on": [{"turn_id": r.turn_id, "step_id": r.step_id} for r in (task.depends_on or [])],
             "citations": list(raw.citations) if raw.citations else [],
             "outputs": dict(prev_ctx.get("outputs", {})) if isinstance(prev_ctx, dict) else {},
         }
@@ -563,6 +620,21 @@ class MultiAgentOrchestrator:
         self._upsert_task_context(state, task, raw)
         # 根据订单状态生成下一步动作
         self._append_order_pending_actions(state, task_id=task.id, raw=raw)
+        conv = state["session"]["conversation"]
+        tc = runtime.get("task_context", {}).get(task.id, {})
+        payload = dict(tc) if isinstance(tc, dict) else {}
+        self.session_store.put_step_artifact(
+            conv.session_id,
+            StepArtifact(
+                turn_id=runtime.get("turn_id") or "",
+                step_id=task.id,
+                intent=task.intent,
+                status=raw.status,
+                message=(raw.message or "")[:4000],
+                error=raw.error,
+                payload=payload,
+            ),
+        )
         return {"runtime": {**runtime, "current_task_index": idx + 1}}
 
 
@@ -572,11 +644,12 @@ class MultiAgentOrchestrator:
         start = perf_counter()
         runtime = state["runtime"]
         tasks = runtime.get("sub_tasks", [])
-        idx = self._next_ready_task_index(tasks)
+        cur_turn = runtime.get("turn_id") or ""
+        sid = state["session"]["conversation"].session_id
+        idx = self._next_ready_task_index(tasks, sid, cur_turn)
         if idx is None:
             return {"runtime": {**runtime, "route": "all_done"}}
         task = tasks[idx]
-        sid = state["session"]["conversation"].session_id
         active_order = self.session_store.get_order(sid)
         intent = task.intent
         obs = state["trace"]["observability"]
@@ -597,17 +670,105 @@ class MultiAgentOrchestrator:
         if state["trace"]["observability"].errors:
             return "safe_response"
         route = state["runtime"].get("route", "unknown")
-        if route in {"query", "rule", "order", "handoff", "all_done"}:
+        if route in {"query", "rule", "order", "handoff", "session_meta", "all_done"}:
             return route
             #异常兜底
         return "unknown"
+    @staticmethod
+    def _search_question_with_user_context(task_text: str, user_utterance: str) -> str:
+        """指代消解：子任务文案可能省略「刚才说的」，把完整用户句带给 Text-to-SQL。"""
+        t = (task_text or "").strip()
+        u = (user_utterance or "").strip()
+        if not u:
+            return t
+        if u in t or t in u:
+            return t
+        if any(k in u for k in ("刚才", "之前", "上次", "上文", "那句", "说的是", "前面")):
+            return f"{t}\n（用户完整原话：{u}）"
+        return t
+
+    def _same_turn_dep_snippets(
+        self, runtime: dict[str, Any], refs: list[StepRef], cur_turn: str
+    ) -> dict[str, str]:
+        tc = runtime.get("task_context") or {}
+        out: dict[str, str] = {}
+        if not isinstance(tc, dict):
+            return out
+        for ref in refs:
+            if ref.turn_id != cur_turn:
+                continue
+            ctx = tc.get(ref.step_id)
+            if isinstance(ctx, dict):
+                out[ref.step_id] = json.dumps(ctx, ensure_ascii=False)[:4000]
+        return out
+
+    def _resolve_dep_ctx(self, runtime: dict[str, Any], ref: StepRef, session_id: str) -> dict[str, Any]:
+        cur = runtime.get("turn_id") or ""
+        if ref.turn_id == cur:
+            ctx = runtime.get("task_context", {}).get(ref.step_id)
+            return dict(ctx) if isinstance(ctx, dict) else {}
+        art = self.session_store.get_step_artifact(session_id, ref.step_id)
+        if art is None:
+            return {}
+        return dict(art.payload) if isinstance(art.payload, dict) else {}
+
+    def _collect_dep_order_items_refs(
+        self, runtime: dict[str, Any], refs: list[StepRef], session_id: str
+    ) -> list[OrderCollectedItem]:
+        merged: list[OrderCollectedItem] = []
+        seen: set[tuple[str, str]] = set()
+        for ref in refs:
+            dep_ctx = self._resolve_dep_ctx(runtime, ref, session_id)
+            for item in self._collect_items_from_dep_context(dep_ctx):
+                key = (item["item_name"], item["quantity"])
+                if key in seen:
+                    continue
+                seen.add(key)
+                merged.append(item)
+        return merged
+
+    def _collect_dep_cancel_order_ids_refs(
+        self, runtime: dict[str, Any], refs: list[StepRef], session_id: str
+    ) -> list[str]:
+        out: list[str] = []
+        seen: set[str] = set()
+        for ref in refs:
+            dep_ctx = self._resolve_dep_ctx(runtime, ref, session_id)
+            outputs = dep_ctx.get("outputs")
+            if not isinstance(outputs, dict):
+                continue
+            for key in ("unpaid_order_ids", "order_ids", "cancel_order_ids"):
+                vals = outputs.get(key)
+                if not isinstance(vals, list):
+                    continue
+                for raw in vals:
+                    oid = str(raw or "").strip()
+                    if not oid or oid in seen:
+                        continue
+                    seen.add(oid)
+                    out.append(oid)
+        return out
+
 #查询节点 执行查询任务
     def _query_node(self, state: GraphState) -> GraphState:
         start = perf_counter()
         runtime = state["runtime"]
         idx = runtime["current_task_index"]
         task = runtime["sub_tasks"][idx]
-        out = self.search_agent.handle_with_state(state, task.text)
+        sid = state["session"]["conversation"].session_id
+        cur_turn = runtime.get("turn_id") or ""
+        ut = (runtime.get("text") or "").strip()
+        snippets = self._same_turn_dep_snippets(runtime, list(task.depends_on or []), cur_turn)
+        qtext = self.injectors.build_query_text(
+            task,
+            ut,
+            turn_id=cur_turn,
+            session_id=sid,
+            store=self.session_store,
+            dep_snippets=snippets or None,
+        )
+        qtext = self._search_question_with_user_context(qtext, ut)
+        out = self.search_agent.handle_with_state(state, qtext)
         state["trace"]["observability"].node_timings["query_agent_ms"] = (perf_counter() - start) * 1000
         return out
 #规则节点 执行规则任务
@@ -616,7 +777,19 @@ class MultiAgentOrchestrator:
         runtime = state["runtime"]
         idx = runtime["current_task_index"]
         task = runtime["sub_tasks"][idx]
-        out = self.rag_tool.handle_with_state(state, task.text)
+        sid = state["session"]["conversation"].session_id
+        cur_turn = runtime.get("turn_id") or ""
+        ut = (runtime.get("text") or "").strip()
+        snippets = self._same_turn_dep_snippets(runtime, list(task.depends_on or []), cur_turn)
+        rtext = self.injectors.build_rule_query(
+            task,
+            ut,
+            turn_id=cur_turn,
+            session_id=sid,
+            store=self.session_store,
+            dep_snippets=snippets or None,
+        )
+        out = self.rag_tool.handle_with_state(state, rtext)
         state["trace"]["observability"].node_timings["rule_agent_ms"] = (perf_counter() - start) * 1000
         return out
 
@@ -671,54 +844,6 @@ class MultiAgentOrchestrator:
                 merged.append(normalized)
         return merged
 
-    def _collect_dep_order_items(
-        self, runtime: dict[str, Any], dep_ids: list[str]
-    ) -> list[OrderCollectedItem]:
-        task_ctx = runtime.get("task_context", {})
-        if not isinstance(task_ctx, dict):
-            return []
-        merged: list[OrderCollectedItem] = []
-        seen: set[tuple[str, str]] = set()
-        for dep_id in dep_ids:
-            dep_ctx = task_ctx.get(dep_id)
-            if not isinstance(dep_ctx, dict):
-                continue
-            items = self._collect_items_from_dep_context(dep_ctx)
-            for item in items:
-                key = (item["item_name"], item["quantity"])
-                if key in seen:
-                    continue
-                seen.add(key)
-                merged.append(item)
-        return merged
-
-    def _collect_dep_cancel_order_ids(
-        self, runtime: dict[str, Any], dep_ids: list[str]
-    ) -> list[str]:
-        task_ctx = runtime.get("task_context", {})
-        if not isinstance(task_ctx, dict):
-            return []
-        out: list[str] = []
-        seen: set[str] = set()
-        for dep_id in dep_ids:
-            dep_ctx = task_ctx.get(dep_id)
-            if not isinstance(dep_ctx, dict):
-                continue
-            outputs = dep_ctx.get("outputs")
-            if not isinstance(outputs, dict):
-                continue
-            for key in ("unpaid_order_ids", "order_ids", "cancel_order_ids"):
-                vals = outputs.get(key)
-                if not isinstance(vals, list):
-                    continue
-                for raw in vals:
-                    oid = str(raw or "").strip()
-                    if not oid or oid in seen:
-                        continue
-                    seen.add(oid)
-                    out.append(oid)
-        return out
-
     def _fetch_order_items_by_order_ids(
         self, order_ids: list[str], user_id: str
     ) -> list[OrderCollectedItem]:
@@ -759,8 +884,9 @@ class MultiAgentOrchestrator:
         idx = runtime["current_task_index"]
         task = runtime["sub_tasks"][idx]
         #获取订单上下文
-        ctx = self.session_store.get_or_create_order(conv.session_id, conv.user_id) 
-        dep_ids = list(task.depends_on or [])
+        ctx = self.session_store.get_or_create_order(conv.session_id, conv.user_id)
+        dep_refs = list(task.depends_on or [])
+        dep_step_ids = [r.step_id for r in dep_refs]
         user_text = runtime.get("text") or ""
         combined = f"{user_text}\n{task.text}".strip()
         hint = task.order_operation_hint if isinstance(task, OrderTask) else None
@@ -769,10 +895,9 @@ class MultiAgentOrchestrator:
         loaded_items_count = 0 #加载到的订单条目
 
         # 若订单任务存在依赖：按订单操作类型提取依赖信息。
-        if dep_ids:
-            # 按“下单同款”统一读取依赖，再按操作类型消费字段。
-            dep_items = self._collect_dep_order_items(runtime, dep_ids)
-            dep_order_ids = self._collect_dep_cancel_order_ids(runtime, dep_ids)
+        if dep_refs:
+            dep_items = self._collect_dep_order_items_refs(runtime, dep_refs, conv.session_id)
+            dep_order_ids = self._collect_dep_cancel_order_ids_refs(runtime, dep_refs, conv.session_id)
 
             if dep_items:
                 loaded_items_count = len(dep_items)
@@ -828,7 +953,11 @@ class MultiAgentOrchestrator:
                         phase="dependency_injection",
                         codes=[dep_error],
                         operation=chain_op,
-                        extra={"depends_on": dep_ids},
+                        extra={
+                            "depends_on": [
+                                {"turn_id": r.turn_id, "step_id": r.step_id} for r in dep_refs
+                            ]
+                        },
                     ),
                 )
                 #记录订单轨迹
@@ -836,7 +965,7 @@ class MultiAgentOrchestrator:
                     OrderTaskRecord(
                         task_id=task.id,
                         operation=None,
-                        source_dep_task_ids=dep_ids,
+                        source_dep_task_ids=dep_step_ids,
                         loaded_items_count=0,
                         status=raw.status,
                         message=raw.message,
@@ -852,7 +981,7 @@ class MultiAgentOrchestrator:
             OrderTaskRecord(
                 task_id=task.id,
                 operation=ctx.operation,
-                source_dep_task_ids=dep_ids,
+                source_dep_task_ids=dep_step_ids,
                 loaded_items_count=loaded_items_count,
                 status=out["runtime"]["raw"].status if out.get("runtime", {}).get("raw") else None,
                 message=out["runtime"]["raw"].message if out.get("runtime", {}).get("raw") else None,
@@ -875,6 +1004,29 @@ class MultiAgentOrchestrator:
                 ),
             }
         }
+    def _session_meta_node(self, state: GraphState) -> GraphState:
+        start = perf_counter()
+        runtime = state["runtime"]
+        conv = state["session"]["conversation"]
+        idx = runtime["current_task_index"]
+        task = runtime["sub_tasks"][idx]
+        ut = (runtime.get("text") or "").strip()
+        focus = (
+            self.injectors.build_session_meta_focus(task, ut)
+            if task.depends_on
+            else ut
+        )
+        msg = format_session_meta_reply(conv, focus)
+        state["trace"]["observability"].node_timings["session_meta_agent_ms"] = (
+            perf_counter() - start
+        ) * 1000
+        return {
+            "runtime": {
+                **runtime,
+                "raw": AgentResult(route="session_meta", status="ok", message=msg),
+            }
+        }
+
 #未知节点 兜底
     def _unknown_node(self, state: GraphState) -> GraphState:
         runtime = state["runtime"]
@@ -901,15 +1053,17 @@ class MultiAgentOrchestrator:
                 ),
             }
         }
-#安全响应节点 兜底
+#安全响应节点（观测到 errors 时进入）
     def _safe_response_node(self, state: GraphState) -> GraphState:
+        errs = list(state["trace"]["observability"].errors or [])
+        detail = "; ".join(str(e) for e in errs) if errs else "未记录具体错误条目（observability.errors 为空）"
         return {
             "runtime": {
                 **state["runtime"],
                 "raw": AgentResult(
                     route="unknown",
                     status="safe_response",
-                    message="系统繁忙，请稍后重试或换一种问法。",
+                    message=f"执行中断：{detail}",
                     error="graph_safe_response",
                 ),
             }

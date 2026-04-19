@@ -36,6 +36,10 @@ def legacy_chat(req: LegacyChatRequest) -> dict:
     user_id = (req.user_username or "guest").strip() or "guest"
     try:
         _, result = orchestrator.process_message(user_id=user_id, text=user_text, session_id=None)
-        return {"reply": result.message, "citations": result.citations}
+        return {
+            "reply": result.message,
+            "citations": result.citations,
+            "turn_id": getattr(result, "turn_id", None),
+        }
     except Exception as exc:
-        return {"reply": "当前请求处理超时或失败，请稍后重试。", "citations": None, "error": str(exc)}
+        return {"reply": f"请求失败：{exc!r}", "citations": None, "error": str(exc)}

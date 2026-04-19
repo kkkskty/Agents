@@ -17,21 +17,20 @@ def _collection_names(client: Any) -> list[str]:
 
 
 def _get_chroma_collection(client: Any, preferred: str) -> Any:
-    """优先使用 preferred；不存在时若库内仅有 1 个集合则回退。"""
+    """打开指定名称的集合；失败时列出当前库内集合名以便排查。"""
     try:
         return client.get_collection(name=preferred)
-    except Exception:
+    except Exception as exc:
         names = _collection_names(client)
         if not names:
             raise RuntimeError(
-                f"Chroma 目录下没有任何集合，请确认 CHROMA_PATH={SETTINGS.chroma_path} 且已完成向量入库。"
-            ) from None
-        if len(names) == 1:
-            return client.get_collection(name=names[0])
+                f"无法打开集合「{preferred}」，且 CHROMA_PATH 下无任何集合。"
+                f" CHROMA_PATH={SETTINGS.chroma_path}。原因：{exc!r}"
+            ) from exc
         raise RuntimeError(
             f"未找到集合「{preferred}」。当前存在的集合：{names}。"
-            "请在 .env 中设置 RAG_COLLECTION_NAME 为其中之一。"
-        ) from None
+            f"请在 .env 中设置 RAG_COLLECTION_NAME。原因：{exc!r}"
+        ) from exc
 
 
 def _chunk_id_from_metadata(cid: Any, idx: int) -> int:

@@ -106,7 +106,11 @@ class ConversationState:
     session_id: str
     user_id: str
     turn_index: int = 0
+    """会话结构版本；升级 StepRef 等模型时递增。"""
+    session_schema_version: int = 2
     history: list[ConversationTurn] = field(default_factory=list)
+    """被裁剪出热窗口后的折叠文本，供 IntentRouter 等使用。"""
+    memory_summary: str = ""
     last_intent: str | None = None
     active_intent: str | None = None
 
@@ -185,13 +189,43 @@ class HandoffState:
     status: str = "inactive"
 
 
+@dataclass(frozen=True)
+class StepRef:
+    """依赖边：turn_id + 会话内全局唯一的 step_id（形如 {turn_uuid}:task_0）。"""
+
+    turn_id: str
+    step_id: str
+
+
+@dataclass
+class StepArtifact:
+    """单步执行产物，供跨轮依赖与 Injector 消费。
+
+    turn_id — 本子任务所属用户轮次 id（一轮用户输入对应一次 process_message、一个 turn_id）。
+    step_id — 会话内唯一步骤 id，与编排里 BaseTask.id 一致；SessionStore 按 session_id + step_id 索引。
+    intent — 子任务意图：query / rule / order / handoff / session_meta / unknown 等。
+    status — 本步执行状态，与 AgentResult.status 对齐（如 ok、error、collecting_info、no_result）。
+    message — 可读摘要文本，通常来自 AgentResult.message（入库时可截断）。
+    error — 失败时的错误码或简要标识；成功一般为 None。
+    payload — 结构化上下文副本（如 runtime「task_context」对应 task 的字典），跨轮依赖主要读此字段而非仅读 message。
+    """
+
+    turn_id: str
+    step_id: str
+    intent: str
+    status: str
+    message: str = ""
+    error: str | None = None
+    payload: dict[str, Any] = field(default_factory=dict)
+
+
 @dataclass
 class BaseTask:
     id: str
     text: str
     intent: Literal["query", "rule", "order", "handoff", "unknown", "session_meta"]
     status: str = "pending"
-    depends_on: list[str] = field(default_factory=list)
+    depends_on: list[StepRef] = field(default_factory=list)
 
 
 @dataclass
@@ -238,6 +272,7 @@ class RuntimeState(TypedDict, total=False):
     """单轮编排执行态。"""
 
     text: str
+    turn_id: str
     route: str
     sub_tasks: list[Task]
     task_results: list[dict[str, Any]]
@@ -282,3 +317,4 @@ class AgentResult:
     sub_task_progress: str | None = None
     pending_actions: list[dict[str, Any]] | None = None
     sql_query: str | None = None
+    turn_id: str | None = None

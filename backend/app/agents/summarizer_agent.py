@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from app.chains.order_validation import merge_debug_trace
+from app.core.conversation_context import build_context_for_summarizer
 from app.core.llm_provider import LLMRouter
 from app.core.settings import load_settings
 from app.core.state import AgentResult
@@ -68,46 +69,6 @@ def _citation_snippets(citations: list[dict[str, Any]], limit: int = 8) -> str:
     return "\n".join(rows) if rows else "（无）"
 
 
-def _fallback_answer_from_citations(question: str, citations: list[dict[str, Any]]) -> str:
-    if not citations:
-        return "当前没有检索到可用证据，建议补充更具体的问题关键词。"
-
-    q_tokens = [t for t in question.replace("？", " ").replace("，", " ").split() if t]
-    candidates: list[str] = []
-    for c in citations[:6]:
-        s = str(c.get("snippet") or "").strip()
-        if not s:
-            continue
-        s = s.replace("\r", " ").replace("\n", " ")
-        parts = [p.strip() for p in s.replace("。", "；").split("；") if p.strip()]
-        candidates.extend(parts[:4])
-
-    if not candidates:
-        return "已检索到相关证据，但未提取到有效要点。请查看下方引用。"
-
-    scored: list[tuple[int, str]] = []
-    for p in candidates:
-        score = sum(2 for tk in q_tokens if tk and tk in p)
-        score += sum(1 for kw in ("步骤", "处理", "联系", "提交", "核查", "转人工", "失败", "规则") if kw in p)
-        scored.append((score, p))
-    scored.sort(key=lambda x: x[0], reverse=True)
-
-    picked: list[str] = []
-    seen: set[str] = set()
-    for _, p in scored:
-        t = p[:60] + ("..." if len(p) > 60 else "")
-        if t in seen:
-            continue
-        seen.add(t)
-        picked.append(t)
-        if len(picked) >= 3:
-            break
-
-    if not picked:
-        return "已检索到相关证据，请查看下方引用。"
-    return f"结合检索证据，与你的问题最相关的要点是：{'；'.join(picked)}。"
-
-
 # -----------------------------------------------------------------------------
 # SQL 结果改写（LLM）
 # -----------------------------------------------------------------------------
@@ -115,11 +76,14 @@ def _fallback_answer_from_citations(question: str, citations: list[dict[str, Any
 _MAX_QUERY_SYNTH_BODY = 4500
 
 _SQL_SKIP_PHRASES = (
-    "未查询到相关数据",
-    "查询执行失败",
+    "查询无数据",
+    "SQL 执行失败",
+    "生成 SQL 失败",
+    "生成 SQL 超时",
+    "sql_chain_unavailable",
     "大模型未配置",
     "无法生成查询",
-    "大模型生成的 SQL 不可用",
+    "生成的 SQL 不可用",
 )
 
 
@@ -156,6 +120,13 @@ class SummarizerAgent:
         settings = load_settings()
         self.llm = LLMRouter(settings.summarizer_agent_llm)
 
+    @staticmethod
+    def _prompt_with_dialogue(dialogue_context: str, body: str) -> str:
+        dc = (dialogue_context or "").strip()
+        if not dc:
+            return body
+        return f"【对话背景】\n{dc}\n\n{body}"
+
     def _synthesize_sql_answer(
         self,
         *,
@@ -163,6 +134,7 @@ class SummarizerAgent:
         subtask_text: str,
         query_message: str,
         task_status: str,
+        dialogue_context: str = "",
     ) -> str:
         qm = (query_message or "").strip()
         if _should_skip_sql_llm_rewrite(task_status, qm):
@@ -170,7 +142,7 @@ class SummarizerAgent:
         body = (
             qm if len(qm) <= _MAX_QUERY_SYNTH_BODY else qm[:_MAX_QUERY_SYNTH_BODY] + "\n…（以下略）"
         )
-        prompt = (
+        core = (
             "你是电商数据客服。下面「查询结果」来自数据库 SELECT，是客观事实。\n"
             "请按用户真正关心的问题组织回答，禁止只罗列编号条目而不作答。\n"
             "结构要求：\n"
@@ -186,13 +158,14 @@ class SummarizerAgent:
             f"【子任务】\n{subtask_text}\n\n"
             f"【查询结果】\n{body}\n"
         )
+        prompt = self._prompt_with_dialogue(dialogue_context, core)
         try:
             txt = self.llm.invoke_text(prompt)
             if txt and txt.strip():
                 return txt.strip()
-        except Exception:
-            pass
-        return qm
+        except Exception as exc:
+            return f"查询结果改写失败：{exc!r}\n【原始查询输出】\n{qm}"
+        return f"查询结果改写失败：模型返回空文本。\n【原始查询输出】\n{qm}"
 
     def _answer_from_outputs_and_citations(
         self,
@@ -202,6 +175,7 @@ class SummarizerAgent:
         citations: list[dict[str, Any]],
         *,
         current_user_text: str,
+        dialogue_context: str = "",
     ) -> str:
         snippets = _citation_snippets(citations)
         drop_items = outputs.get("drop_items") or []
@@ -211,7 +185,7 @@ class SummarizerAgent:
             if outputs
             else "结构化输出：无"
         )
-        prompt = (
+        core = (
             "你是客服总结助手。请基于引用证据进行总结，回答要精炼、可执行。"
             "不要逐字抄写引用原文，不要编造事实。\n"
             f"【本轮用户完整输入】\n{current_user_text}\n\n"
@@ -220,16 +194,18 @@ class SummarizerAgent:
             f"{outputs_hint}\n"
             f"引用证据：\n{snippets}"
         )
-        fallback = _fallback_answer_from_citations(question, citations)
+        prompt = self._prompt_with_dialogue(dialogue_context, core)
         try:
             txt = self.llm.invoke_text(prompt)
             if txt:
                 return txt
-        except Exception:
-            pass
-        return fallback
+        except Exception as exc:
+            return f"汇总生成失败：{exc!r}"
+        return "汇总生成失败：模型返回空文本。"
 
-    def _answer_for_subtask(self, st: _SubtaskView, *, user_text: str) -> str:
+    def _answer_for_subtask(
+        self, st: _SubtaskView, *, user_text: str, dialogue_context: str = ""
+    ) -> str:
         q = st.question
         intent = st.intent
         status = st.status
@@ -248,18 +224,33 @@ class SummarizerAgent:
                     subtask_text=q,
                     query_message=msg,
                     task_status=status,
+                    dialogue_context=dialogue_context,
                 )
             return self._answer_from_outputs_and_citations(
-                q, intent, outputs, citations, current_user_text=user_text
+                q,
+                intent,
+                outputs,
+                citations,
+                current_user_text=user_text,
+                dialogue_context=dialogue_context,
             )
 
         if intent == "rule":
             if status in ("error", "failed"):
-                return (msg or "").strip() or "规则检索失败，请稍后重试。"
+                err = str(tr.get("error") or "").strip()
+                base = (msg or "").strip()
+                if base and err:
+                    return f"{base}（error={err}）"
+                return base or err or f"规则检索失败（status={status}）。"
             if status == "no_result" and not citations:
-                return (msg or "").strip() or "未检索到相关规则。"
+                return (msg or "").strip() or "规则检索无结果（无引用）。"
             return self._answer_from_outputs_and_citations(
-                q, intent, outputs, citations, current_user_text=user_text
+                q,
+                intent,
+                outputs,
+                citations,
+                current_user_text=user_text,
+                dialogue_context=dialogue_context,
             )
 
         if intent == "order":
@@ -324,6 +315,9 @@ class SummarizerAgent:
         runtime = state["runtime"]
         trace = state["trace"]
         user_text = (runtime["text"] or "").strip()
+        settings = load_settings()
+        conv = state["session"]["conversation"]
+        dialogue_ctx = build_context_for_summarizer(conv, user_text, settings)
 
         tasks: list[Any] = list(runtime["sub_tasks"])
         task_results = runtime["task_results"]
@@ -370,7 +364,9 @@ class SummarizerAgent:
                 citations=citations,
                 result_row=tr,
             )
-            ans = self._answer_for_subtask(st, user_text=user_text)
+            ans = self._answer_for_subtask(
+                st, user_text=user_text, dialogue_context=dialogue_ctx
+            )
 
             if self._line_prefix_use_plain(st.intent, n_tasks, st.status):
                 lines.append(ans)
@@ -418,5 +414,6 @@ class SummarizerAgent:
         final_result.sub_task_count = total
         final_result.sub_task_progress = f"{done}/{total}" if total else None
         final_result.pending_actions = runtime["pending_actions"]
+        final_result.turn_id = runtime.get("turn_id")
 
         return {"runtime": {**runtime, "result": final_result}}

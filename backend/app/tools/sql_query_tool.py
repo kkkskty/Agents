@@ -19,6 +19,8 @@ JOIN_TABLE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 LIMIT_PATTERN = re.compile(r"\blimit\s+\d+\s*$", re.IGNORECASE)
+# Text-to-SQL 偶发写出 SUM(...) OVER (...) 等窗口函数，MySQL 3593：禁止在此类查询上下文中使用。
+_WINDOW_OVER_PATTERN = re.compile(r"\bOVER\s*\(", re.IGNORECASE)
 
 # WHERE 子句中出现的 user_id = 字面量须与当前会话用户一致（防模型代查他人）
 _USER_ID_EQ_PATTERN = re.compile(
@@ -149,6 +151,12 @@ def _append_limit(sql: str, max_rows: int) -> str:
     return f"{sql} LIMIT {max_rows}"
 
 
+def validate_sql_before_execute(sql: str) -> None:
+    """在执行前拦截明知会失败的方言/写法（避免依赖数据库报错）。"""
+    if _WINDOW_OVER_PATTERN.search(sql or ""):
+        raise ValueError("window_function_not_allowed")
+
+
 def is_valid_select_with_from(sql: str) -> bool:
     if not SELECT_PATTERN.search(sql or ""):
         return False
@@ -167,9 +175,34 @@ def _normalize_sql_statement(sql: str) -> str:
     return s
 
 
+def _fix_bare_session_user_equals(sql: str, user_id: str) -> str:
+    """模型常输出 user_id = demo_user（无引号），MySQL 会当成列名。将会话标识为字母数字下划线时改为带引号字面量。"""
+    uid = str(user_id).strip()
+    if not uid or uid.isdigit():
+        return sql
+    if not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", uid):
+        return sql
+    esc = uid.replace("\\", "\\\\").replace("'", "''")
+    pat = re.compile(
+        rf"(?P<lhs>\b(?:[a-zA-Z_][a-zA-Z0-9_]*\.)?user_id)\s*=\s*(?!['\"])(?P<rhs>{re.escape(uid)})\b",
+        re.IGNORECASE,
+    )
+    return pat.sub(rf"\g<lhs> = '{esc}'", sql)
+
+
+def _escape_percent_for_pymysql(sql: str) -> str:
+    """cursor.execute(sql, params) 时，SQL 串里未转义的 % 会与 %s 占位冲突（如 LIKE '%x%'）。"""
+    if "%s" not in sql:
+        return sql.replace("%", "%%")
+    parts = sql.split("%s")
+    escaped = [p.replace("%", "%%") for p in parts]
+    return "%s".join(escaped)
+
+
 def execute_user_scoped_sql(sql: str, user_id: str) -> list[dict[str, Any]]:
     settings = load_settings()
     sql = _normalize_sql_statement(sql)
+    sql = _fix_bare_session_user_equals(sql, user_id)
     if not sql:
         raise ValueError("empty_sql")
     table = _extract_table_name(sql)
@@ -180,9 +213,11 @@ def execute_user_scoped_sql(sql: str, user_id: str) -> list[dict[str, Any]]:
     if ";" in sql:
         raise ValueError("multi_statement_not_allowed")
     _validate_user_id_literals_match_session(sql, user_id)
+    validate_sql_before_execute(sql)
 
     scoped_sql, params = _enforce_user_scope(sql, table, user_id)
     scoped_sql = _append_limit(scoped_sql, settings.sql_max_rows)
+    scoped_sql = _escape_percent_for_pymysql(scoped_sql)
 
     conn = pymysql.connect(
         host=settings.mysql_host,
