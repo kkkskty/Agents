@@ -126,6 +126,11 @@ class RagTaskRecord:
     retrieved_chunks: list[dict[str, Any]] = field(default_factory=list)
     filtered_chunks: list[dict[str, Any]] = field(default_factory=list)
     selected_citations: list[dict[str, Any]] = field(default_factory=list)
+    rewrite_queries: list[str] = field(default_factory=list)
+    context_preview: str = ""
+    generated_answer: str = ""
+    confidence: float | None = None
+    postprocess_flags: list[str] = field(default_factory=list)
 
 
 @dataclass

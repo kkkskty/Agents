@@ -12,3 +12,5 @@ python-dotenv
 httpx
 pymysql
 sqlalchemy
+qdrant-client
+elasticsearch>=8.14.0,<9

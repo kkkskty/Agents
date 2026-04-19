@@ -1,15 +1,18 @@
+"""受控 SELECT 执行：表白名单、属主列注入、PyMySQL 安全执行；预检可插拔。"""
+
+from __future__ import annotations
+
 import re
+from collections.abc import Callable
 from typing import Any
 
 import pymysql
 from pymysql.cursors import DictCursor
 
 from app.core.settings import load_settings
-from app.tools.sql_catalog import SHOP_TABLE_CATALOG
-
+from app.db_access.catalog import TableCatalog, get_default_catalog
 
 SELECT_PATTERN = re.compile(r"^\s*select\b", re.IGNORECASE)
-# FROM `orders` 或 FROM orders（表名用反引号时，反引号与空格之间无 \b，不能依赖尾部 \b）
 FROM_TABLE_PATTERN = re.compile(
     r"\bfrom\s+(?:`([^`]+)`|([a-zA-Z_][a-zA-Z0-9_]*))(?=\s|$|;|\))",
     re.IGNORECASE,
@@ -19,14 +22,37 @@ JOIN_TABLE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 LIMIT_PATTERN = re.compile(r"\blimit\s+\d+\s*$", re.IGNORECASE)
-# Text-to-SQL 偶发写出 SUM(...) OVER (...) 等窗口函数，MySQL 3593：禁止在此类查询上下文中使用。
 _WINDOW_OVER_PATTERN = re.compile(r"\bOVER\s*\(", re.IGNORECASE)
-
-# WHERE 子句中出现的 user_id = 字面量须与当前会话用户一致（防模型代查他人）
 _USER_ID_EQ_PATTERN = re.compile(
     r"\buser_id\s*=\s*(?:'([^']*)'|\"([^\"]*)\"|(\d+))",
     re.IGNORECASE,
 )
+
+# 预检：可 `register_sql_preflight_check` 追加，或测试时替换
+PREFLIGHT_SQL_CHECKS: list[Callable[[str], None]] = []
+
+
+def register_sql_preflight_check(fn: Callable[[str], None]) -> None:
+    PREFLIGHT_SQL_CHECKS.append(fn)
+
+
+def _preflight_no_window_function(sql: str) -> None:
+    if _WINDOW_OVER_PATTERN.search(sql or ""):
+        raise ValueError("window_function_not_allowed")
+
+
+def _run_preflight_sql_checks(sql: str) -> None:
+    for fn in PREFLIGHT_SQL_CHECKS:
+        fn(sql)
+
+
+# 模块默认预检
+PREFLIGHT_SQL_CHECKS.append(_preflight_no_window_function)
+
+
+def validate_sql_before_execute(sql: str) -> None:
+    """与历史 API 兼容：执行全部已注册预检。"""
+    _run_preflight_sql_checks(sql)
 
 
 def _extract_table_name(sql: str) -> str | None:
@@ -37,28 +63,7 @@ def _extract_table_name(sql: str) -> str | None:
     return name.lower() if name else None
 
 
-def _extract_referenced_tables(sql: str) -> set[str]:
-    def _normalize_table_token(raw: str) -> str:
-        # 兼容 schema.table / `schema`.`table` / table 三种写法，只保留实际表名部分。
-        token = str(raw or "").strip().strip("`").lower()
-        if "." in token:
-            token = token.split(".")[-1].strip("`")
-        return token
-
-    tables: set[str] = set()
-    for m in FROM_TABLE_PATTERN.finditer(sql or ""):
-        name = _normalize_table_token(m.group(1) or m.group(2) or "")
-        if name:
-            tables.add(name)
-    for m in JOIN_TABLE_PATTERN.finditer(sql or ""):
-        name = _normalize_table_token(m.group(1) or m.group(2) or "")
-        if name:
-            tables.add(name)
-    return tables
-
-
 def _validate_user_id_literals_match_session(sql: str, user_id: str) -> None:
-    """若 SQL 中显式写了 user_id = 字面量，必须与当前会话 user_id 一致。"""
     uid = str(user_id).strip()
     for m in _USER_ID_EQ_PATTERN.finditer(sql):
         raw = m.group(1) if m.group(1) is not None else (m.group(2) if m.group(2) is not None else m.group(3))
@@ -69,10 +74,8 @@ def _validate_user_id_literals_match_session(sql: str, user_id: str) -> None:
 
 
 def _qualify_owner_column(sql: str, table_name: str, owner_col: str) -> str:
-    """单表可写裸列名；含 JOIN 时必须带表名/别名，否则 MySQL 报列歧义。"""
     if not re.search(r"\bjoin\b", sql, re.IGNORECASE):
         return owner_col
-    # FROM orders o JOIN / FROM `orders` AS `o` JOIN（别名可能带反引号）
     m = re.search(
         r"\bfrom\s+(?:`([^`]+)`|([a-zA-Z_][a-zA-Z0-9_]*))"
         r"\s+(?:as\s+)?(?:`([^`]+)`|([a-zA-Z_][a-zA-Z0-9_]*))\s+"
@@ -84,7 +87,6 @@ def _qualify_owner_column(sql: str, table_name: str, owner_col: str) -> str:
         alias = (m.group(3) or m.group(4) or "").strip()
         if alias:
             return f"{alias}.{owner_col}"
-    # FROM orders JOIN ...（无别名）
     m = re.search(
         r"\bfrom\s+(?:`([^`]+)`|([a-zA-Z_][a-zA-Z0-9_]*))\s+"
         r"(?:(?:natural|inner|left|right|cross|straight)(?:\s+outer)?\s+)*join\b",
@@ -99,7 +101,6 @@ def _qualify_owner_column(sql: str, table_name: str, owner_col: str) -> str:
 
 
 def _first_clause_after_select(sql: str) -> int:
-    """GROUP BY / HAVING / ORDER BY / LIMIT 中最早出现的位置；无则 len(sql)。"""
     clause_kw = [
         r"\bgroup\s+by\b",
         r"\bhaving\b",
@@ -114,8 +115,8 @@ def _first_clause_after_select(sql: str) -> int:
     return insert_at
 
 
-def _enforce_user_scope(sql: str, table_name: str, user_id: str) -> tuple[str, list[Any]]:
-    spec = SHOP_TABLE_CATALOG.get(table_name)
+def _enforce_user_scope(sql: str, table_name: str, user_id: str, catalog: TableCatalog) -> tuple[str, list[Any]]:
+    spec = catalog.get(table_name)
     if spec is None:
         raise ValueError(f"table_not_allowed:{table_name}")
 
@@ -129,8 +130,6 @@ def _enforce_user_scope(sql: str, table_name: str, user_id: str) -> tuple[str, l
     insert_at = _first_clause_after_select(sql)
     has_where = re.search(r"\bwhere\b", sql, re.IGNORECASE) is not None
 
-    # 已有 WHERE：必须把 AND owner=... 插在 WHERE 条件之后、ORDER/LIMIT 等之前，
-    # 绝不能接在整个 SQL 末尾（否则会生成「LIMIT 5 AND user_id=%s」非法语法）。
     if has_where:
         head = sql[:insert_at].rstrip()
         tail = sql[insert_at:].lstrip()
@@ -151,12 +150,6 @@ def _append_limit(sql: str, max_rows: int) -> str:
     return f"{sql} LIMIT {max_rows}"
 
 
-def validate_sql_before_execute(sql: str) -> None:
-    """在执行前拦截明知会失败的方言/写法（避免依赖数据库报错）。"""
-    if _WINDOW_OVER_PATTERN.search(sql or ""):
-        raise ValueError("window_function_not_allowed")
-
-
 def is_valid_select_with_from(sql: str) -> bool:
     if not SELECT_PATTERN.search(sql or ""):
         return False
@@ -168,7 +161,6 @@ def extract_sql_primary_table(sql: str) -> str | None:
 
 
 def _normalize_sql_statement(sql: str) -> str:
-    """去掉首尾空白与末尾分号；模型常输出 `... LIMIT 5;` 单条语句，不应与多语句混为一谈。"""
     s = sql.strip()
     while s.endswith(";"):
         s = s[:-1].rstrip()
@@ -176,7 +168,6 @@ def _normalize_sql_statement(sql: str) -> str:
 
 
 def _fix_bare_session_user_equals(sql: str, user_id: str) -> str:
-    """模型常输出 user_id = demo_user（无引号），MySQL 会当成列名。将会话标识为字母数字下划线时改为带引号字面量。"""
     uid = str(user_id).strip()
     if not uid or uid.isdigit():
         return sql
@@ -191,7 +182,6 @@ def _fix_bare_session_user_equals(sql: str, user_id: str) -> str:
 
 
 def _escape_percent_for_pymysql(sql: str) -> str:
-    """cursor.execute(sql, params) 时，SQL 串里未转义的 % 会与 %s 占位冲突（如 LIKE '%x%'）。"""
     if "%s" not in sql:
         return sql.replace("%", "%%")
     parts = sql.split("%s")
@@ -199,7 +189,12 @@ def _escape_percent_for_pymysql(sql: str) -> str:
     return "%s".join(escaped)
 
 
-def execute_user_scoped_sql(sql: str, user_id: str) -> list[dict[str, Any]]:
+def execute_user_scoped_sql(
+    sql: str,
+    user_id: str,
+    catalog: TableCatalog | None = None,
+) -> list[dict[str, Any]]:
+    cat = catalog or get_default_catalog()
     settings = load_settings()
     sql = _normalize_sql_statement(sql)
     sql = _fix_bare_session_user_equals(sql, user_id)
@@ -208,14 +203,14 @@ def execute_user_scoped_sql(sql: str, user_id: str) -> list[dict[str, Any]]:
     table = _extract_table_name(sql)
     if not table:
         raise ValueError("missing_from_table")
-    if table not in SHOP_TABLE_CATALOG:
+    if cat.get(table) is None:
         raise ValueError(f"table_not_allowed:{table}")
     if ";" in sql:
         raise ValueError("multi_statement_not_allowed")
     _validate_user_id_literals_match_session(sql, user_id)
     validate_sql_before_execute(sql)
 
-    scoped_sql, params = _enforce_user_scope(sql, table, user_id)
+    scoped_sql, params = _enforce_user_scope(sql, table, user_id, cat)
     scoped_sql = _append_limit(scoped_sql, settings.sql_max_rows)
     scoped_sql = _escape_percent_for_pymysql(scoped_sql)
 

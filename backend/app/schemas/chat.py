@@ -14,7 +14,7 @@ class ChatMessageRequest(BaseModel):
 
 class Citation(BaseModel):
     source: str
-    chunk_id: int
+    chunk_id: int | str
     distance: float | None = None
     snippet: str | None = None
 

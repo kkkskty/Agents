@@ -15,7 +15,7 @@ from app.core.state import AgentResult
 # Citations（去重聚合）
 # -----------------------------------------------------------------------------
 
-_CitationKey = tuple[str, int, str]
+_CitationKey = tuple[str, str, str]
 
 
 def _collect_task_citations(state: dict[str, Any], task_id: str) -> list[dict[str, Any]]:
@@ -24,7 +24,11 @@ def _collect_task_citations(state: dict[str, Any], task_id: str) -> list[dict[st
 
     def push(c: dict[str, Any]) -> None:
         source = str(c.get("source") or "unknown")
-        chunk_id = int(c.get("chunk_id") or 0)
+        raw_chunk_id = c.get("chunk_id")
+        if raw_chunk_id is None:
+            chunk_id = "0"
+        else:
+            chunk_id = str(raw_chunk_id).strip() or "0"
         snippet = str(c.get("snippet") or "").strip()
         if not snippet:
             return

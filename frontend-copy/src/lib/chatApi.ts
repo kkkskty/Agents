@@ -26,6 +26,16 @@ function mapAssistantRequestError(e: unknown): Error {
   return new Error('请求失败，请稍后重试。')
 }
 
+function sanitizeBackendError(raw?: string): string {
+  const msg = (raw || '').trim()
+  if (!msg) return ''
+  // 屏蔽底层系统异常细节，避免前端直接暴露如 [Errno xx] / OSError 等信息
+  if (/\[Errno\s*\d+\]|Invalid argument|OSError|WinError/i.test(msg)) {
+    return '系统处理过程中出现异常，请稍后重试；如持续失败请联系人工客服。'
+  }
+  return msg
+}
+
 export async function fetchHealth(apiBase: string): Promise<HealthResponse> {
   try {
     const res = await fetch(`${apiBase}/api/v1/health`)
@@ -199,8 +209,9 @@ export async function requestAssistantReply(
     const reply = data.reply
     if (typeof reply === 'string' && reply.trim()) {
       const isError = data.status === 'error'
-      const body = isError && data.error?.trim()
-        ? `${reply.trim()}\n\n（详情：${data.error.trim()}）`
+      const cleanedError = sanitizeBackendError(data.error)
+      const body = isError && cleanedError
+        ? `${reply.trim()}\n\n（详情：${cleanedError}）`
         : reply.trim()
       return {
         reply: body,
@@ -212,7 +223,7 @@ export async function requestAssistantReply(
       }
     }
     if (data.status === 'error' && data.error?.trim()) {
-      throw new Error(`大模型服务异常：${data.error.trim()}`)
+      throw new Error(`大模型服务异常：${sanitizeBackendError(data.error)}`)
     }
     throw new Error('接口未返回有效回复字段（reply / message）')
   }

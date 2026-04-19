@@ -30,7 +30,7 @@ from app.core.step_dag import global_step_id
 from app.core.conversation_context import build_context_for_router
 from app.core.session_store import SessionStore
 from app.core.settings import load_settings
-from app.tools.sql_query_tool import execute_user_scoped_sql
+from app.db_access import execute_user_scoped_sql
 from app.core.session_meta_reply import format_session_meta_reply
 from app.core.state import (
     AgentResult,

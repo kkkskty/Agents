@@ -5,16 +5,17 @@ from urllib.parse import quote_plus
 from langchain_classic.chains.sql_database.query import create_sql_query_chain
 from langchain_community.utilities import SQLDatabase
 
-from app.agents.query_display import (
+from app.db_access import (
     build_citation_snippets,
     build_query_result_template,
     build_search_task_outputs,
+    catalog_prompt_text,
+    execute_user_scoped_sql,
+    is_valid_select_with_from,
 )
 from app.core.state import AgentResult, SqlQueryTaskRecord
 from app.core.llm_provider import LLMRouter
 from app.core.settings import load_settings
-from app.tools.sql_catalog import catalog_prompt_text
-from app.tools.sql_query_tool import execute_user_scoped_sql, is_valid_select_with_from
 
 
 class SearchAgent:

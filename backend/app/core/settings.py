@@ -57,6 +57,27 @@ class AppSettings:
     rag_embedding_model: str
     rag_embedding_base_url: str
     rag_embedding_api_key: str | None
+    rag_vector_backend: str
+    qdrant_url: str
+    qdrant_api_key: str | None
+    qdrant_collection: str
+    es_url: str
+    es_api_key: str | None
+    es_index: str
+    rag_filter_tenant_id: str
+    rag_filter_region: str
+    rag_score_threshold: float
+    rag_enable_rerank: bool
+    rag_context_char_budget: int
+    rag_generation_max_snippets: int
+    milvus_uri: str
+    milvus_token: str | None
+    milvus_collection_name: str
+    milvus_metric_type: str
+    milvus_search_params: str
+    bge_model_name: str
+    bge_device: str
+    bge_batch_size: int
     mock_order_base_url: str
     mysql_host: str
     mysql_port: int
@@ -70,6 +91,11 @@ class AppSettings:
     memory_summary_max_chars: int
     summarizer_context_rounds: int
     summarizer_context_max_chars: int
+    #: SQL 结果行→outputs：未支付状态集合（逗号分隔，小写）
+    sql_unpaid_statuses: frozenset[str]
+    sql_row_order_id_keys: tuple[str, ...]
+    sql_row_product_name_keys: tuple[str, ...]
+    sql_max_proposed_order_items: int
 
 
 def _as_bool(name: str, default: bool) -> bool:
@@ -105,6 +131,17 @@ def _as_list(name: str, default: list[str]) -> list[str]:
         return default
     values = [x.strip() for x in raw.split(",")]
     return [x for x in values if x]
+
+
+def _parse_sql_unpaid_statuses(default_csv: str) -> frozenset[str]:
+    raw = os.getenv("SQL_UNPAID_STATUSES", default_csv)
+    return frozenset(x.strip().lower() for x in raw.split(",") if x.strip())
+
+
+def _sql_key_tuple(name: str, default_csv: str) -> tuple[str, ...]:
+    raw = os.getenv(name)
+    csv = raw if raw is not None else default_csv
+    return tuple(x.strip() for x in csv.split(",") if x.strip())
 
 
 def _resolve_rag_embedding_api_key() -> str | None:
@@ -192,6 +229,27 @@ def load_settings() -> AppSettings:
             .rstrip("/")
         ),
         rag_embedding_api_key=_resolve_rag_embedding_api_key(),
+        rag_vector_backend=(os.getenv("RAG_VECTOR_BACKEND", "hybrid").strip().lower() or "hybrid"),
+        qdrant_url=(os.getenv("QDRANT_URL", "http://127.0.0.1:6333").strip() or "http://127.0.0.1:6333"),
+        qdrant_api_key=os.getenv("QDRANT_API_KEY"),
+        qdrant_collection=(os.getenv("QDRANT_COLLECTION", "rule_clauses").strip() or "rule_clauses"),
+        es_url=(os.getenv("ES_URL", "http://127.0.0.1:9200").strip() or "http://127.0.0.1:9200"),
+        es_api_key=os.getenv("ES_API_KEY"),
+        es_index=(os.getenv("ES_INDEX", "rule_clauses").strip() or "rule_clauses"),
+        rag_filter_tenant_id=(os.getenv("RAG_FILTER_TENANT_ID", "default_tenant").strip() or "default_tenant"),
+        rag_filter_region=(os.getenv("RAG_FILTER_REGION", "cn").strip() or "cn"),
+        rag_score_threshold=_as_float("RAG_SCORE_THRESHOLD", 0.0),
+        rag_enable_rerank=_as_bool("RAG_ENABLE_RERANK", True),
+        rag_context_char_budget=max(600, _as_int("RAG_CONTEXT_CHAR_BUDGET", 2400)),
+        rag_generation_max_snippets=max(1, _as_int("RAG_GENERATION_MAX_SNIPPETS", 3)),
+        milvus_uri=os.getenv("MILVUS_URI", "http://127.0.0.1:19530").strip(),
+        milvus_token=os.getenv("MILVUS_TOKEN"),
+        milvus_collection_name=(os.getenv("MILVUS_COLLECTION_NAME") or "rag_kb").strip() or "rag_kb",
+        milvus_metric_type=(os.getenv("MILVUS_METRIC_TYPE", "COSINE").strip().upper() or "COSINE"),
+        milvus_search_params=(os.getenv("MILVUS_SEARCH_PARAMS", '{"nprobe": 16}').strip() or '{"nprobe": 16}'),
+        bge_model_name=(os.getenv("BGE_MODEL_NAME") or "BAAI/bge-small-zh-v1.5").strip(),
+        bge_device=(os.getenv("BGE_DEVICE") or "cpu").strip(),
+        bge_batch_size=max(1, _as_int("BGE_BATCH_SIZE", 32)),
         mock_order_base_url=os.getenv("MOCK_ORDER_BASE_URL", "https://mock-order.local"),
         mysql_host=os.getenv("MYSQL_HOST", "127.0.0.1"),
         mysql_port=_as_int("MYSQL_PORT", 3306),
@@ -205,4 +263,11 @@ def load_settings() -> AppSettings:
         memory_summary_max_chars=max(500, _as_int("MEMORY_SUMMARY_MAX_CHARS", 4000)),
         summarizer_context_rounds=max(1, _as_int("SUMMARIZER_CONTEXT_ROUNDS", 2)),
         summarizer_context_max_chars=max(800, _as_int("SUMMARIZER_CONTEXT_MAX_CHARS", 4000)),
+        sql_unpaid_statuses=_parse_sql_unpaid_statuses("pending,unpaid,awaiting_payment"),
+        sql_row_order_id_keys=_sql_key_tuple("SQL_ROW_ORDER_ID_KEYS", "id,order_id"),
+        sql_row_product_name_keys=_sql_key_tuple(
+            "SQL_ROW_PRODUCT_NAME_KEYS",
+            "product_name,name,item_name",
+        ),
+        sql_max_proposed_order_items=max(1, _as_int("SQL_MAX_PROPOSED_ORDER_ITEMS", 20)),
     )
