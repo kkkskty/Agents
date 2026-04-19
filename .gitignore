@@ -48,7 +48,7 @@ config_local.py
 secrets.json
 .env
 需求文档.md
-.md
+*.md
 
 
 # =========================
